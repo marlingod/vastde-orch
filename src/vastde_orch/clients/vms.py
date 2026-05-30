@@ -1,0 +1,546 @@
+"""Thin idempotency layer over vastpy.VASTClient.
+
+The pattern: every mutation goes through `ensure_*(name, **spec)`:
+  1. GET resource filtered by name.
+  2. If not present → POST and return CREATED.
+  3. If present and any spec field differs → PATCH and return UPDATED.
+  4. Else → UNCHANGED.
+
+That is the only mutation pattern this module exposes; callers cannot bypass
+it. Plan/dry-run mode is implemented at this layer too: if `dry_run=True`,
+no POST/PATCH/DELETE is sent — only the would-be DiffResult is returned.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any
+
+from vastpy import VASTClient
+
+from vastde_orch.config.models import VmsSpec
+
+
+class DiffResult(str, Enum):
+    CREATED = "created"
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
+    DELETED = "deleted"
+    WOULD_CREATE = "would_create"
+    WOULD_UPDATE = "would_update"
+    WOULD_DELETE = "would_delete"
+
+
+@dataclass
+class EnsureOutcome:
+    result: DiffResult
+    resource: str
+    name: str
+    id: int | None
+    drift: dict[str, Any]  # fields that differed (empty for CREATED/UNCHANGED)
+
+
+def _drift(desired: dict[str, Any], observed: dict[str, Any]) -> dict[str, Any]:
+    """Return only the keys in `desired` whose value differs from observed.
+
+    Lists are compared element-wise (order-sensitive — VAST APIs are
+    order-sensitive for lists like protocols=['NFS','SMB']).
+    """
+    out: dict[str, Any] = {}
+    for k, v in desired.items():
+        if observed.get(k) != v:
+            out[k] = v
+    return out
+
+
+class VmsClient:
+    """Thin idempotent wrapper around vastpy.VASTClient."""
+
+    def __init__(self, spec: VmsSpec, *, dry_run: bool = False) -> None:
+        self._dry_run = dry_run
+        self._tenant_name = spec.tenant  # The TARGET tenant — used by callers, not as a request header.
+        # Important: do NOT pass `tenant=` to vastpy here. The vms-level
+        # credentials are typically a cluster-admin; sending X-Tenant-Name with
+        # those creds causes VMS to reject the request as "invalid user/password".
+        # Tenant-scoped requests (e.g. /dataengine/) construct a separate
+        # client via `enablement/enable.py:_tenant_scoped_raw()`.
+        self._raw = VASTClient(
+            address=spec.address,
+            token=spec.token,
+            user=spec.user,
+            password=spec.password,
+            version=spec.api_version or "latest",
+        )
+
+    @property
+    def raw(self) -> VASTClient:
+        """Direct access to the underlying vastpy client for one-off calls."""
+        return self._raw
+
+    # ── generic ensure ───────────────────────────────────────────────────
+
+    def ensure(
+        self,
+        resource: str,
+        *,
+        key_field: str,
+        key_value: str,
+        spec: dict[str, Any],
+        patchable_fields: set[str] | None = None,
+    ) -> EnsureOutcome:
+        """Generic get-then-create-or-patch.
+
+        Args:
+            resource: vastpy attribute name, e.g. "views", "viewpolicies".
+            key_field: field to filter on for the lookup, typically "name" or "path".
+            key_value: the value to filter by.
+            spec: full desired body to POST when creating.
+            patchable_fields: if provided, restrict PATCH to this subset of `spec`.
+                When None, every drifted field is sent.
+        """
+        endpoint = getattr(self._raw, resource)
+        matches = endpoint.get(**{key_field: key_value})
+        if not matches:
+            if self._dry_run:
+                return EnsureOutcome(DiffResult.WOULD_CREATE, resource, key_value, None, spec)
+            created = endpoint.post(**spec)
+            return EnsureOutcome(DiffResult.CREATED, resource, key_value, created.get("id"), {})
+
+        existing = matches[0]
+        drift = _drift(spec, existing)
+        if patchable_fields is not None:
+            drift = {k: v for k, v in drift.items() if k in patchable_fields}
+
+        if not drift:
+            return EnsureOutcome(
+                DiffResult.UNCHANGED, resource, key_value, existing.get("id"), {}
+            )
+
+        if self._dry_run:
+            return EnsureOutcome(
+                DiffResult.WOULD_UPDATE, resource, key_value, existing.get("id"), drift
+            )
+        endpoint[existing["id"]].patch(**drift)
+        return EnsureOutcome(DiffResult.UPDATED, resource, key_value, existing["id"], drift)
+
+    def delete(self, resource: str, *, key_field: str, key_value: str) -> EnsureOutcome:
+        endpoint = getattr(self._raw, resource)
+        matches = endpoint.get(**{key_field: key_value})
+        if not matches:
+            return EnsureOutcome(DiffResult.UNCHANGED, resource, key_value, None, {})
+        existing = matches[0]
+        if self._dry_run:
+            return EnsureOutcome(
+                DiffResult.WOULD_DELETE, resource, key_value, existing.get("id"), {}
+            )
+        endpoint[existing["id"]].delete()
+        return EnsureOutcome(DiffResult.DELETED, resource, key_value, existing["id"], {})
+
+    # ── typed conveniences ──────────────────────────────────────────────
+
+    def ensure_tenant(self, name: str, *, domain: str | None = None) -> EnsureOutcome:
+        spec: dict[str, Any] = {"name": name}
+        if domain is not None:
+            spec["domain"] = domain
+        return self.ensure("tenants", key_field="name", key_value=name, spec=spec)
+
+    def ensure_viewpolicy(
+        self,
+        name: str,
+        *,
+        tenant_id: int,
+        security_flavor: str = "S3_NATIVE",
+        bucket_listing_groups: list[str] | None = None,
+    ) -> EnsureOutcome:
+        spec: dict[str, Any] = {
+            "name": name,
+            "tenant_id": tenant_id,
+            "flavor": security_flavor,
+        }
+        if bucket_listing_groups:
+            spec["s3_bucket_listing_groups"] = bucket_listing_groups
+        return self.ensure("viewpolicies", key_field="name", key_value=name, spec=spec)
+
+    def ensure_view(
+        self,
+        path: str,
+        *,
+        policy_id: int,
+        protocols: list[str],
+        tenant_id: int | None = None,
+        bucket_name: str | None = None,
+        bucket_owner: str | None = None,
+        vip_pool_ids: list[int] | None = None,
+        create_dir: bool = True,
+    ) -> EnsureOutcome:
+        spec: dict[str, Any] = {
+            "path": path,
+            "policy_id": policy_id,
+            "protocols": protocols,
+            "create_dir": create_dir,
+        }
+        if tenant_id is not None:
+            spec["tenant_id"] = tenant_id
+        if bucket_name is not None:
+            spec["bucket"] = bucket_name
+        if bucket_owner is not None:
+            spec["bucket_owner"] = bucket_owner
+        if vip_pool_ids:
+            # Required when protocols include KAFKA. Field name verified
+            # against swagger: `kafka_vip_pools` (NOT `vip_pools`).
+            spec["kafka_vip_pools"] = vip_pool_ids
+        return self.ensure(
+            "views",
+            key_field="path",
+            key_value=path,
+            spec=spec,
+            patchable_fields={"protocols", "policy_id"},
+        )
+
+    def ensure_vippool(
+        self,
+        name: str,
+        *,
+        tenant_id: int,
+        cidr: str,
+        ip_range_start: str,
+        ip_range_end: str,
+        role: str = "PROTOCOLS",
+    ) -> EnsureOutcome:
+        # VAST's vippool API stores subnet_cidr as JUST the mask suffix
+        # (e.g. "24", "16"), NOT the full CIDR "10.0.0.0/24".
+        # Accept either form for operator convenience.
+        # See docs/vms-endpoints-reference.md §/vippools/.
+        mask_only = cidr.split("/")[-1] if "/" in cidr else cidr
+        spec: dict[str, Any] = {
+            "name": name,
+            "tenant_id": tenant_id,
+            "subnet_cidr": mask_only,
+            "ip_ranges": [[ip_range_start, ip_range_end]],
+            "role": role,
+        }
+        return self.ensure("vippools", key_field="name", key_value=name, spec=spec)
+
+    def ensure_topic(
+        self,
+        name: str,
+        *,
+        tenant_id: int,
+        database_name: str,
+    ) -> EnsureOutcome:
+        """Create or verify a Kafka topic on a broker view.
+
+        Verified against VAST 5.4.3: /topics/ requires both tenant_id and
+        database_name as QUERY params. database_name is the broker view's
+        `bucket` field. Body only needs `name`.
+
+        Per /schemas/?tenant_id=N&database_name=B, the implicit schema is
+        always `kafka_topics` for Kafka-protocol views; we don't need to
+        pass schema_name on creation.
+
+        Returns CREATED/UNCHANGED. There is no PATCH — partitions/retention
+        and similar config live elsewhere (likely the broker view itself).
+        See docs/vms-endpoints-reference.md `/topics/`.
+        """
+        # GET-first idempotency.
+        existing = self._raw.topics.get(tenant_id=tenant_id, database_name=database_name)
+        rows = existing.get("results", []) if isinstance(existing, dict) else (existing or [])
+        if any(t.get("name") == name for t in rows):
+            return EnsureOutcome(
+                result=DiffResult.UNCHANGED, resource="topics",
+                name=name, id=None, drift={},
+            )
+        if self._dry_run:
+            return EnsureOutcome(
+                result=DiffResult.WOULD_CREATE, resource="topics",
+                name=name, id=None,
+                drift={"name": name, "database_name": database_name, "tenant_id": tenant_id},
+            )
+        self._raw.topics.post(name=name, tenant_id=tenant_id, database_name=database_name)
+        return EnsureOutcome(
+            result=DiffResult.CREATED, resource="topics",
+            name=name, id=None, drift={},
+        )
+
+    def ensure_group(
+        self, name: str, *, gid: int, provider: str, local_provider_id: int = 1,
+    ) -> EnsureOutcome:
+        """Create a group. VAST API requires local_provider_id (default 1 = the
+        default VAST provider). The `provider` kwarg is kept for backward
+        compatibility but only the local_provider_id is sent.
+        """
+        spec = {"name": name, "gid": gid, "local_provider_id": local_provider_id}
+        return self.ensure("groups", key_field="name", key_value=name, spec=spec)
+
+    def ensure_user(
+        self,
+        name: str,
+        *,
+        uid: int,
+        provider: str,
+        leading_group: str | None = None,
+        local_provider_id: int = 1,
+        allow_create_bucket: bool = True,
+        allow_delete_bucket: bool = True,
+    ) -> EnsureOutcome:
+        spec: dict[str, Any] = {
+            "name": name,
+            "uid": uid,
+            "local_provider_id": local_provider_id,
+            "allow_create_bucket": allow_create_bucket,
+            "allow_delete_bucket": allow_delete_bucket,
+        }
+        if leading_group:
+            spec["leading_group"] = leading_group
+        return self.ensure("users", key_field="name", key_value=name, spec=spec)
+
+    def ensure_k8scluster(
+        self, name: str, *, api_server: str, tenant_id: int
+    ) -> EnsureOutcome:
+        spec = {"name": name, "api_server_url": api_server, "tenant_id": tenant_id}
+        return self.ensure("k8sclusters", key_field="name", key_value=name, spec=spec)
+
+    # The 36 standard tenant-admin permissions matching what the VMS Web UI
+    # grants when a tenant admin role has all 9 realms × 4 actions selected.
+    # Verified live on var203 by attaching them to demo-tenant-admin-role
+    # via `permissions_list` (the undocumented PATCH /roles/{id}/ field).
+    STANDARD_TENANT_ADMIN_PERMISSIONS: tuple[str, ...] = tuple(
+        f"{action}_{realm}"
+        for realm in (
+            "applications", "database", "events", "hardware", "logical",
+            "monitoring", "security", "settings", "support",
+        )
+        for action in ("create", "view", "edit", "delete")
+    )
+
+    def ensure_role(
+        self,
+        name: str,
+        *,
+        tenant_id: int,
+        ldap_groups: list[str] | None = None,
+        permissions: list[str] | None = None,
+    ) -> EnsureOutcome:
+        """Create or update a tenant-scoped role with explicit permissions.
+
+        ⚠️ IMPORTANT: contrary to what swagger suggests, VMS does NOT
+        auto-populate tenant-admin permissions on role creation. The role
+        is created empty (0 perms) and must be granted permissions via the
+        UNDOCUMENTED `permissions_list` field on PATCH /roles/{id}/.
+
+        Discovered by grep'ing the VMS Web UI bundle for "Update Administrative
+        Role" → `onSubmit()` sends `{name, permissions_list, ldap_groups, ...}`
+        to the existing role's PATCH endpoint.
+
+        Args:
+            permissions: list of perm codenames like "create_security",
+                "view_database", etc. If None, defaults to
+                STANDARD_TENANT_ADMIN_PERMISSIONS (the 9 realms × 4 actions
+                set used by every other tenant-admin role on the cluster).
+
+        See docs/vms-endpoints-reference.md `/roles/`.
+        """
+        spec: dict[str, Any] = {"name": name, "tenant_id": tenant_id}
+        if ldap_groups is not None:
+            spec["ldap_groups"] = ldap_groups
+        outcome = self.ensure(
+            "roles", key_field="name", key_value=name,
+            spec=spec, patchable_fields={"ldap_groups"},
+        )
+        # Always (re-)apply permissions — they live in a separate field
+        # and the API ignores the standard `permissions` field on POST.
+        # In dry-run we skip the side-effect.
+        if not self._dry_run and outcome.id is not None:
+            perms = list(permissions) if permissions is not None else list(
+                self.STANDARD_TENANT_ADMIN_PERMISSIONS
+            )
+            try:
+                # The role might exist already with the desired perms; only
+                # PATCH if the live set differs (avoids noisy "updated" outcomes).
+                live = self._raw.roles[outcome.id].get()
+                current = set(live.get("permissions") or [])
+                if current != set(perms):
+                    self._raw.roles[outcome.id].patch(permissions_list=perms)
+            except Exception:
+                # Swallow — the role itself was created/exists; perms can be
+                # set manually if this fails (e.g. on VMS versions where
+                # permissions_list isn't accepted).
+                pass
+        return outcome
+
+    def ensure_manager(
+        self,
+        username: str,
+        *,
+        tenant_id: int | None,
+        password: str | None = None,
+        user_type: str = "TENANT_ADMIN",
+        role_ids: list[int] | None = None,
+        first_name: str = "",
+        last_name: str = "",
+        is_active: bool = True,
+    ) -> EnsureOutcome:
+        """Create or update a VMS manager (admin user).
+
+        Managers are CLUSTER-LEVEL accounts that can log in to the VMS web UI
+        and call tenant-scoped REST endpoints like /dataengine/. They are
+        separate from filesystem users at /users/.
+
+        Required for tenant-admin: tenant_id, user_type=TENANT_ADMIN, at least
+        one role (role IDs are passed; the API resolves them), AND a password.
+
+        Password handling:
+          - On POST (create), `password` MUST be included or VMS returns
+            "null value in column password_id of relation permissions_manager".
+            Swagger does not list `password` in the body schema but the
+            live API accepts and requires it on create.
+          - On PATCH (update), `password` is omitted from drift detection
+            — use set_manager_password() to change it later.
+        """
+        spec: dict[str, Any] = {
+            "username": username,
+            "user_type": user_type,
+            "is_active": is_active,
+            "first_name": first_name,
+            "last_name": last_name,
+        }
+        if tenant_id is not None:
+            spec["tenant_id"] = tenant_id
+        if role_ids:
+            spec["roles"] = role_ids
+        if password is not None:
+            spec["password"] = password
+        return self.ensure(
+            "managers",
+            key_field="username",
+            key_value=username,
+            spec=spec,
+            # Don't try to PATCH `password` (it's never returned on GET so
+            # we'd false-positive a diff every time). Use set_manager_password().
+            patchable_fields={"is_active", "first_name", "last_name", "roles"},
+        )
+
+    def set_manager_password(self, username: str, password: str) -> EnsureOutcome:
+        """Rotate a manager's password.
+
+        Verified against VAST 5.4.3 SP4: /managers/password/ PATCH only accepts
+        the currently-authenticated user's password change (returns "Only
+        password field(s) can be updated" if `username` is in the body). To
+        change another user's password we PATCH /managers/{id}/ with just
+        {"password": "..."}.
+        """
+        if self._dry_run:
+            return EnsureOutcome(
+                result=DiffResult.WOULD_UPDATE, resource="managers/password",
+                name=username, id=None, drift={"password": "***"},
+            )
+        try:
+            matches = self._raw.managers.get(username=username)
+            if not matches:
+                return EnsureOutcome(
+                    result=DiffResult.UNCHANGED, resource="managers/password",
+                    name=username, id=None,
+                    drift={"error": f"manager {username!r} not found"},
+                )
+            mgr_id = matches[0]["id"]
+            self._raw.managers[mgr_id].patch(password=password)
+        except Exception as exc:
+            return EnsureOutcome(
+                result=DiffResult.UNCHANGED, resource="managers/password",
+                name=username, id=None,
+                drift={"error": str(exc)[:200]},
+            )
+        return EnsureOutcome(
+            result=DiffResult.UPDATED, resource="managers/password",
+            name=username, id=None, drift={"password": "set"},
+        )
+
+    def assign_role_to_realm(self, realm_id: int, role_id: int) -> EnsureOutcome:
+        """PATCH /realms/{id}/assign/ to bind a role to a tenant realm.
+
+        Swagger is partial; we send {role_id} based on observed behavior.
+        Idempotent on the VAST side (re-assigning a bound role is a no-op).
+        """
+        if self._dry_run:
+            return EnsureOutcome(
+                result=DiffResult.WOULD_UPDATE, resource="realms/assign",
+                name=f"realm={realm_id} role={role_id}", id=realm_id,
+                drift={"role_id": role_id},
+            )
+        try:
+            self._raw.realms[realm_id].assign.patch(role_id=role_id)
+        except Exception as exc:
+            return EnsureOutcome(
+                result=DiffResult.UNCHANGED, resource="realms/assign",
+                name=f"realm={realm_id} role={role_id}", id=realm_id,
+                drift={"error": str(exc)[:200]},
+            )
+        return EnsureOutcome(
+            result=DiffResult.UPDATED, resource="realms/assign",
+            name=f"realm={realm_id} role={role_id}", id=realm_id, drift={},
+        )
+
+    def ensure_container_registry(
+        self,
+        name: str,
+        *,
+        base_url: str,
+        tenant_id: int,
+        k8scluster_id: int,
+        auth_method: str,
+        username: str | None = None,
+        password: str | None = None,
+        secret_name: str | None = None,
+    ) -> EnsureOutcome:
+        spec: dict[str, Any] = {
+            "name": name,
+            "base_url": base_url,
+            "tenant_id": tenant_id,
+            "primary_k8scluster_id": k8scluster_id,
+            "auth_method": auth_method,
+        }
+        if username:
+            spec["username"] = username
+        if password:
+            spec["password"] = password
+        if secret_name:
+            spec["secret_name"] = secret_name
+        return self.ensure("containerregistries", key_field="name", key_value=name, spec=spec)
+
+    # ── one-off helpers ─────────────────────────────────────────────────
+
+    def get_or_raise(self, resource: str, *, key_field: str, key_value: str) -> dict[str, Any]:
+        matches = getattr(self._raw, resource).get(**{key_field: key_value})
+        if not matches:
+            raise LookupError(f"{resource} with {key_field}={key_value!r} not found")
+        return matches[0]
+
+    def get_or_placeholder(
+        self, resource: str, *, key_field: str, key_value: str, placeholder_id: int = 0,
+    ) -> dict[str, Any]:
+        """Lookup that tolerates "not found" in dry-run mode.
+
+        In dry-run, downstream orchestration steps reference IDs from earlier
+        steps that haven't actually been created yet. Use this lookup variant
+        when the missing resource is one we would have created in the same
+        plan; it returns a placeholder dict so the orchestrator can keep
+        building the plan diff.
+
+        In real-run mode, behaves identically to `get_or_raise`.
+        """
+        try:
+            return self.get_or_raise(resource, key_field=key_field, key_value=key_value)
+        except LookupError:
+            if not self._dry_run:
+                raise
+            return {"id": placeholder_id, key_field: key_value, "_placeholder": True}
+
+    def generate_s3_keys(self, user_id: int) -> dict[str, str]:
+        """Generate and return a new S3 access key pair for a user.
+
+        The secret key is only available at creation time; persist it immediately.
+        """
+        if self._dry_run:
+            return {"access_key": "<dry-run>", "secret_key": "<dry-run>"}
+        return self._raw.users[user_id].access_keys.post()

@@ -1,0 +1,204 @@
+{
+  "model": "claude-opus-4-7",
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Bash(pip install *)",
+      "Bash(pip3 install *)",
+      "Bash(pytest *)",
+      "Bash(python -m pytest *)",
+      "Bash(npm *)",
+      "Bash(npx *)",
+      "Bash(yarn *)",
+      "Bash(pnpm *)",
+      "Bash(go *)",
+      "Bash(cargo *)",
+      "Bash(rustup *)",
+      "Bash(black *)",
+      "Bash(isort *)",
+      "Bash(prettier *)",
+      "Bash(eslint *)",
+      "Bash(gofmt *)",
+      "Bash(rustfmt *)",
+      "Bash(mypy *)",
+      "Bash(tsc *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git checkout *)",
+      "Bash(git branch *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git status)",
+      "Bash(git status *)",
+      "Bash(git stash *)",
+      "Bash(git merge *)",
+      "Bash(git pull *)",
+      "Bash(git push *)",
+      "Bash(git rebase *)",
+      "Bash(git worktree *)",
+      "Bash(git rev-parse *)",
+      "Bash(git remote *)",
+      "Bash(git show *)",
+      "Bash(git tag *)",
+      "Bash(alembic *)",
+      "Bash(prisma *)",
+      "Bash(drizzle-kit *)",
+      "Bash(docker compose *)",
+      "Bash(curl *)",
+      "Bash(cat *)",
+      "Bash(ls *)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(wc *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(touch *)",
+      "Bash(echo *)",
+      "Bash(sort *)",
+      "Bash(uniq *)",
+      "Bash(sed *)",
+      "Bash(awk *)",
+      "Bash(rm *.pyc)",
+      "Bash(rm -rf __pycache__)",
+      "Bash(rm -rf node_modules)",
+      "Bash(rm -rf dist)",
+      "Bash(rm -rf build)",
+      "Bash(rm -rf .next)",
+      "Bash(rm -rf target)",
+      "Bash(rm -rf .pytest_cache)",
+      "Bash(rm -f *.pyc)",
+      "Bash(diff *)",
+      "Bash(which *)",
+      "Bash(env *)",
+      "Bash(date *)",
+      "Bash(pwd)",
+      "Bash(cd *)",
+      "Bash(tree *)",
+      "Bash(xargs *)",
+      "Bash(dirname *)",
+      "Bash(basename *)",
+      "Bash(realpath *)",
+      "Bash(gh *)",
+      "Read",
+      "Write",
+      "Edit",
+      "MultiEdit",
+      "Grep",
+      "Glob"
+    ],
+    "deny": [
+      "Bash(rm -rf /)",
+      "Bash(rm -rf ~)",
+      "Bash(rm -rf .)",
+      "Bash(rm -rf ..)",
+      "Bash(sudo *)",
+      "Bash(chmod 777 *)",
+      "Bash(mkfs *)",
+      "Bash(dd if=*)",
+      "Bash(curl * | sh)",
+      "Bash(curl * | bash)",
+      "Bash(wget * | sh)",
+      "Bash(wget * | bash)"
+    ]
+  },
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/workspace-context.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if command -v osascript &>/dev/null; then osascript -e 'display notification \"Task complete\" with title \"Zero-Question Kit\" sound name \"Glass\"'; elif command -v notify-send &>/dev/null; then notify-send 'Zero-Question Kit' 'Task complete'; fi",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash(pytest *)|Bash(python -m pytest *)|Bash(npx vitest *)|Bash(npx jest *)|Bash(go test *)|Bash(cargo test *)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/tdd-counter.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=\"$CLAUDE_TOOL_INPUT_FILE_PATH\"; case \"$FILE\" in *.py) black --quiet \"$FILE\" 2>/dev/null; isort --quiet \"$FILE\" 2>/dev/null;; *.ts|*.tsx|*.js|*.jsx|*.json|*.css|*.md) npx prettier --write \"$FILE\" 2>/dev/null;; *.go) gofmt -w \"$FILE\" 2>/dev/null;; *.rs) rustfmt \"$FILE\" 2>/dev/null;; esac; true"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=\"$CLAUDE_TOOL_INPUT_FILE_PATH\"; case \"$FILE\" in *.py) [ -d tests/unit ] && cd \"$CLAUDE_PROJECT_DIR\" && pytest tests/unit -x --tb=short -q 2>&1 | tail -40 ;; *.ts|*.tsx|*.js|*.jsx) [ -f package.json ] && cd \"$CLAUDE_PROJECT_DIR\" && (npx vitest run --reporter=basic 2>&1 || npx jest --silent 2>&1) | tail -40 ;; *.go) cd \"$CLAUDE_PROJECT_DIR\" && go test -short ./... 2>&1 | tail -40 ;; esac; true"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash(pytest *)|Bash(python -m pytest *)|Bash(npx vitest *)|Bash(npx jest *)|Bash(go test *)|Bash(cargo test *)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/tdd-post-test.sh"
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/quality-gate.sh"
+          }
+        ]
+      }
+    ],
+    "TeammateIdle": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/assign-next-task.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      }
+    }
+  }
+}

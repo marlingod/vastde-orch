@@ -1,0 +1,86 @@
+# Answers file scoped to demo-tenant (id=15) on var203.selab.vastdata.com.
+# Used for `vastde-orch wizard --answers-file ...` testing — no mutations occur until
+# `enable` / `apply` is run separately.
+vms:
+  address: var203.selab.vastdata.com
+  auth: user_password
+  user_env: VMS_USER
+  password_env: VMS_PASSWORD
+  tenant: demo-tenant
+  api_version: ""
+
+generate_enablement: true
+
+tenant:
+  name: demo-tenant
+  create_if_missing: false
+
+k8s:
+  already_configured: true   # skip Zarf prompts — we are NOT touching k8s in this test
+  name: lab-k8s              # placeholder — won't be applied
+  api_server: https://k8s.placeholder.local:6443
+  kubeconfig: ""
+
+registry:
+  name: demo-registry
+  base_url: registry.placeholder.local
+  auth_method: none
+
+broker:
+  kind: vast
+  view_path: /demo-tenant/de-broker
+  bucket_name: demo-de-broker
+  bucket_owner: demo-owner
+  vip_name: demo-de-vips
+  # Real var203 cluster network (172.200.203.x). Picked the .45-.48 gap.
+  vip_cidr: "16"
+  vip_ip_start: 172.200.203.45
+  vip_ip_end: 172.200.203.48
+  default_topic_name: demo-default
+  default_topic_partitions: 16
+  default_topic_retention: 24
+  dlq_topic_name: demo-dlq
+  dlq_topic_partitions: 4
+  dlq_topic_retention: 24
+
+identity:
+  create_tenant_admin: true
+  group:
+    name: demo-de-users
+    gid: 65500
+    provider: vast
+  users:
+    - { name: demo-owner, uid: 65500 }
+    - { name: demo-alice, uid: 65501 }
+  policy: assign_predefined
+  tenant_admin:
+    username: demo-admin
+    password_env: DEMO_ADMIN_PASSWORD
+    # role_name omitted → defaults to 'demo-tenant-admin-role'
+
+source_views:
+  - path: /demo-tenant/raw-docs
+    bucket: demo-raw-docs
+    owner: demo-owner
+    policy: dataengine-default
+
+generate_pipelines: true
+
+pipelines:
+  - name: demo-pipeline
+    description: Read-only test pipeline; never deployed in this session.
+    namespace: vast-dataengine
+    triggers:
+      - type: element
+        name: demo-pdf-uploaded
+        source_view: /demo-tenant/raw-docs
+        event_type: ElementCreated
+        topic: demo-default
+        object_key_suffix: .pdf
+        object_key_prefix: ""
+    functions:
+      - name: demo-parse-pdf
+        source: ./functions/demo
+        image: registry.placeholder.local/funcs/demo-parse
+    flow:
+      - { from: demo-pdf-uploaded, to: demo-parse-pdf }

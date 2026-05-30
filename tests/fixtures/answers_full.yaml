@@ -1,0 +1,85 @@
+# Pre-filled wizard answers for E2E / CI use.
+# Every key here corresponds to a `Prompter.text/choice/confirm/integer/loop` call
+# in src/vastde_orch/interactive/wizard.py + sections/.
+
+vms:
+  address: vms.example.com
+  auth: token
+  token_env: VMS_TOKEN
+  tenant: data-platform
+  api_version: ""
+
+generate_enablement: true
+
+tenant:
+  name: data-platform
+  create_if_missing: true
+
+k8s:
+  already_configured: false
+  name: prod-k8s
+  api_server: https://k8s:6443
+  kubeconfig: ""
+  zarf_package_path: ./packages/zarf-pkg.tar.zst
+  zarf_init_path: ./packages/zarf-init.tar.zst
+
+registry:
+  name: primary
+  base_url: registry.example.com
+  auth_method: user_credentials
+  username_env: REGISTRY_USER
+  password_env: REGISTRY_PASSWORD
+
+broker:
+  kind: vast
+  view_path: /system/dataengine-broker
+  bucket_name: de-broker
+  bucket_owner: de-broker-owner
+  vip_name: de-broker-vips
+  vip_cidr: 10.30.42.0/24
+  vip_ip_start: 10.30.42.10
+  vip_ip_end: 10.30.42.30
+  default_topic_name: de-default
+  default_topic_partitions: 64
+  default_topic_retention: 168
+  dlq_topic_name: de-deadletter
+  dlq_topic_partitions: 16
+  dlq_topic_retention: 24
+
+identity:
+  group:
+    name: dataengine-users
+    gid: 5000
+    provider: vast
+  users:
+    - { name: de-broker-owner, uid: 10000 }
+    - { name: alice, uid: 10001 }
+    - { name: bob, uid: 10002 }
+  policy: assign_predefined
+
+source_views:
+  - path: /raw/docs
+    bucket: raw-docs
+    owner: de-broker-owner
+    policy: dataengine-default
+
+generate_pipelines: true
+
+pipelines:
+  - name: pdf-ingest
+    description: Parse uploaded PDFs.
+    namespace: vast-dataengine
+    triggers:
+      - type: element
+        name: pdf-uploaded
+        source_view: /raw/docs
+        event_type: ElementCreated
+        topic: de-default
+        object_key_suffix: .pdf
+        object_key_prefix: ""
+    functions:
+      - name: parse-pdf
+        source: ./functions/parse-pdf
+        image: registry.example.com/funcs/parse-pdf
+    flow:
+      - { from: pdf-uploaded, to: parse-pdf }

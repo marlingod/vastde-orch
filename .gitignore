@@ -1,0 +1,22 @@
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.tox/
+.DS_Store
+*.swp
+packages/
+# Sample/lab artifacts that reference live infra — exclude from git
+sample/demo_tenant.yaml*
+# Coverage artifacts
+.coverage*

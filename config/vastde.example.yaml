@@ -1,0 +1,129 @@
+# vastde.example.yaml — full annotated example.
+# Copy to vastde.yaml at the repo root and edit. Validate with:
+#   vastde-orch validate -c vastde.yaml
+
+# ── VMS connection ──────────────────────────────────────────────────────────
+vms:
+  address: ${VMS_ADDRESS}
+  token: ${VMS_TOKEN}          # OR omit token and provide user/password
+  tenant: data-platform
+  api_version: v7              # optional; defaults to "latest"
+
+# ── Stage A: one-shot DataEngine enablement on the tenant ───────────────────
+enablement:
+  tenant:
+    name: data-platform
+    domain: data               # optional URL slug; defaults to tenant name
+    create_if_missing: true
+
+  event_broker:
+    kind: vast                 # `vast` or `kafka`
+    view_path: /system/dataengine-broker
+    bucket_name: de-broker
+    bucket_owner: de-broker-owner    # must be a user created in `identity.users` below
+    view_policy: dataengine-default  # name of the view policy that will be created
+    vip_pool:
+      name: de-broker-vips
+      cidr: 10.30.42.0/24
+      ip_range: ["10.30.42.10", "10.30.42.30"]
+    default_topic:
+      name: de-default
+      partitions: 64
+      retention_hours: 168
+    deadletter_topic:
+      name: de-deadletter
+      partitions: 16
+      retention_hours: 24
+
+  container_registry:
+    name: primary-registry
+    base_url: registry.internal.example.com
+    auth:
+      method: user_credentials # `user_credentials`, `kubernetes_secret`, or `none`
+      username_env: REGISTRY_USER
+      password_env: REGISTRY_PASSWORD
+    tags: [primary, production]
+
+  kubernetes:
+    name: prod-k8s
+    api_server: https://k8s-prod:6443
+    kubeconfig: ~/.kube/config-prod
+    namespaces: [vast-dataengine]
+    zarf_package_path: ./packages/zarf-package-dataengine-amd64-1.0.0.tar.zst
+    zarf_init_path: ./packages/zarf-init-amd64-v0.60.0.tar.zst
+    inotify:
+      instances: 8192
+      watches: 524288
+
+  identity:
+    group:
+      name: dataengine-users
+      gid: 5000
+      provider: vast           # or `ldap` or `active_directory`
+    users:
+      - name: de-broker-owner  # used as the Kafka view's bucket owner
+        uid: 10000
+      - name: alice
+        uid: 10001
+      - name: bob
+        uid: 10002
+    policy: assign_predefined  # or `custom` with `custom_statements:`
+
+  source_views:
+    - path: /raw/docs
+      bucket: raw-docs
+      owner: de-broker-owner
+      policy: dataengine-default
+    - path: /raw/logs
+      bucket: raw-logs
+      owner: de-broker-owner
+      policy: dataengine-default
+
+# ── Stage B: pipelines (declarative pipeline-as-code) ───────────────────────
+pipelines:
+  - name: pdf-ingest
+    description: Parse uploaded PDFs and index their text.
+    namespace: vast-dataengine
+    k8s_cluster: prod-k8s      # must match enablement.kubernetes.name
+    secrets:
+      s3-creds:
+        AWS_ACCESS_KEY_ID: ${S3_KEY}
+        AWS_SECRET_ACCESS_KEY: ${S3_SECRET}
+    env:
+      LOG_LEVEL: INFO
+    triggers:
+      - name: pdf-uploaded
+        type: element
+        source_view: /raw/docs
+        event_type: ElementCreated
+        object_key_suffix: .pdf
+        topic: de-default
+      - name: nightly-rollup
+        type: schedule
+        schedule:
+          simple: "0 2 * * *"
+        topic: de-default
+    functions:
+      - name: parse-pdf
+        source: ./functions/parse-pdf
+        image: registry.internal.example.com/funcs/parse-pdf
+        # tag is computed from a content hash of ./functions/parse-pdf/ by default
+        # tag: v3                # uncomment to pin a version
+        deployment:
+          concurrency: { min: 0, max: 10 }
+          cpu:    { min: 0.5, max: 2 }
+          memory: { min: 512Mi, max: 2Gi }
+          timeout_seconds: 120
+          retries: 2
+          log_level: INFO
+          method_of_delivery: ordered
+      - name: index-doc
+        source: ./functions/index-doc
+        image: registry.internal.example.com/funcs/index-doc
+        deployment:
+          cpu:    { min: 0.25, max: 1 }
+          memory: { min: 256Mi, max: 1Gi }
+    flow:
+      - { from: pdf-uploaded,   to: parse-pdf }
+      - { from: parse-pdf,      to: index-doc }
+      - { from: nightly-rollup, to: index-doc }

@@ -1,0 +1,24 @@
+# Decisions Log
+
+Per CLAUDE.md, automatic decisions made when requirements were ambiguous are recorded here.
+
+| Date       | Decision                                                                                | Rationale                                                                                                          |
+|------------|-----------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------|
+| 2026-05-27 | Trigger/function/pipeline CRUD shells out to `vastde` CLI rather than DataEngine REST   | The VAST DataEngine REST schema is not publicly documented at the resource level; `vastde` is the supported path.  |
+| 2026-05-27 | VMS resources (tenants, views, policies, users, k8s, registries) use the `vastpy` SDK   | Official, schema-less, future-proof against VAST version drift.                                                    |
+| 2026-05-27 | Function image tag defaults to content hash (sha256 of source dir), not `:latest`       | Reproducible deploys, content-addressable, automatic deduplication.                                                |
+| 2026-05-27 | Single YAML config with `vms:`, `enablement:`, `pipelines:` keys (not separate files)   | One source of truth; each stage still runnable independently via subcommands.                                      |
+| 2026-05-27 | Secrets sourced from env vars only (never YAML literals); `.env` is gitignored          | Standard hygiene; allows checking config into git safely.                                                          |
+| 2026-05-27 | `--plan` (dry-run) is supported on `enable`, `apply`, `destroy`                         | Terraform-style; matches operator expectations and reduces accidents.                                              |
+| 2026-05-27 | Pydantic v2 for config validation                                                       | Mature, fast, JSON Schema export.                                                                                  |
+| 2026-05-27 | Click for CLI                                                                           | Composable, mature, project-standard.                                                                              |
+| 2026-05-27 | structlog for logging (JSON in CI, pretty in TTY)                                       | Auditable runs; CI-friendly.                                                                                       |
+| 2026-05-28 | questionary chosen for wizard prompts (over InquirerPy, rich.prompt, beaupy)            | Cookiecutter-tested; clean API; `when=` conditionals; password masking. Research at docs/research-interactive-ux.md.|
+| 2026-05-28 | Wizard generates `vastde.yaml` (review-then-apply); does NOT apply live                 | Safer, GitOps-friendly, matches `pulumi new` / `cookiecutter` / `npm init`. Apply-live is the documented anti-pattern.|
+| 2026-05-28 | `--interactive` confirmation is per resource type with 3-option prompt + sticky `continue` | Per-item prompting is a usability failure (12 confirms for 12 users). Stolen from `pulumi up` + `ansible --step`.|
+| 2026-05-28 | Non-TTY detection: `sys.stdin.isatty()` + `VASTDE_NO_INTERACTIVE=1` + `--non-interactive` flag; exit 2 on violation | The single most common CI footgun for interactive CLIs.                                                            |
+| 2026-05-28 | Tests use inject-answers pattern (Prompter(answers={...})) instead of simulating keystrokes | questionary's prompt_toolkit event loop fights with Click's `CliRunner.input`. Inject-answers is deterministic.    |
+| 2026-05-28 | Interactive apply/enable uses dry-run-then-real (not callback threading)                | Cleaner than weaving callbacks through every client; preserves existing client API; double-call is fine over LAN.   |
+| 2026-05-29 | Tenant-admin role permissions granted via undocumented `permissions_list` field         | Verified live on var203: VMS does NOT auto-populate perms on role create; an empty role causes 401 on tenant-scoped reads. Discovered by grep'ing VMS Web UI bundle for the form submit handler. |
+| 2026-05-29 | `/dataengine/setup-provisioning/` enable uses Bearer JWT from `/token/{tenant}/`         | Verified live: HTTP Basic + Api-Token both rejected by the gateway with misleading "two space-delimited values" error. Only JWT obtained via the tenant-scoped `/token/{tenant_name}/` works. |
+| 2026-05-29 | Auto-applied STANDARD_TENANT_ADMIN_PERMISSIONS (36 perms = 9 realms × 4 actions)        | Standard set across every working tenant admin on the lab cluster (georgia, om, adrian, wi). Includes `create_security` which covers `apikey` (needed for the manager to issue its own tokens).   |
