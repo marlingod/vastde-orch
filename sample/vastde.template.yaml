@@ -1,0 +1,98 @@
+# vastde.yaml — minimal tenant-scoped DataEngine deployment template
+#
+# Workflow: Fill in the REQUIRED fields below; uncomment any OPTIONAL field
+# whose default doesn't suit you. Everything else is auto-derived.
+#
+# Secrets (passwords, API tokens) NEVER go in this file — use *_env to point
+# at an environment variable instead.
+#
+# Prerequisites (cluster admin, one-time, outside this tool):
+#   - The tenant exists
+#   - A PROTOCOLS VIP pool is bound to this tenant
+#   - A tenant-admin manager + role exist on this tenant
+#   - The K8s cluster is reachable and has Zarf + Knative + KEDA + VAST CSI
+
+# ════════════════ REQUIRED ════════════════
+
+vms:
+  address:     var203.selab.vastdata.com         # REQUIRED — VMS hostname or IP
+  tenant_name: my-tenant                         # REQUIRED — target tenant (must exist)
+  auth:
+    user_env:     TENANT_ADMIN_USER              # REQUIRED — env var holding tenant-admin user
+    password_env: TENANT_ADMIN_PASSWORD          # REQUIRED — env var holding tenant-admin pass
+
+vip_pool_name: my-de-vips                        # REQUIRED — name of pre-existing PROTOCOLS pool
+
+k8s:
+  kube_api_url: https://10.143.2.242:6443        # REQUIRED — K8s API server URL
+  mtls:
+    ca_cert_file:     ./certs/ca.pem             # REQUIRED — paths to PEM files; tool base64-encodes
+    client_cert_file: ./certs/client.pem         # REQUIRED
+    client_key_file:  ./certs/client.key         # REQUIRED
+
+registry:
+  url: docker.io                                 # REQUIRED — registry URL (no scheme)
+
+# ════════════════ OPTIONAL (defaults shown — uncomment to override) ════════════════
+
+# identity:
+#   group:
+#     name: de-users                             # group name for DataEngine app users
+#     gid:  65500
+#   bucket_owner:
+#     name:                de-owner              # owns the broker bucket
+#     uid:                 65500
+#     leading_gid:         65500
+#     allow_create_bucket: true
+
+# view_policy:
+#   name:   de-policy                            # one policy shared by all DE views
+#   flavor: MIXED                                # NFS | SMB | S3_NATIVE | MIXED
+
+# broker_view:
+#   path:     /de-broker                         # view path inside the tenant
+#   bucket:   de-broker                          # bucket name → becomes kafka_broker.name
+#   # protocols are forced to [S3, DATABASE, KAFKA] — not configurable
+
+# setup_provisioning:
+#   default_topic_name:     de-default
+#   dead_letter_topic_name: de-dlq
+#   # kafka_broker auto-derived: {type: Internal, name: <broker_view.bucket>}
+#   # vip_pools    auto-derived: [<vip_pool_name → id>]
+
+# k8s:
+#   name:       my-k8s                           # default = host part of kube_api_url
+#   namespaces: [vast-dataengine]                # K8s namespaces DE deploys into
+#   mtls:
+#     name: my-mtls                              # default = "<k8s.name>-mtls"
+
+# registry:
+#   name:      dockerhub                         # default = first segment of url
+#   namespace: vast-dataengine                   # K8s namespace where the imagePullSecret lives
+#   auth_type: password                          # password | none
+#   username_env: REGISTRY_USER                  # required if auth_type=password
+#   password_env: REGISTRY_PASSWORD              # required if auth_type=password
+#   # primary_kubernetes_cluster auto-derived: VRN of k8s.name above
+
+# ════════════════ PIPELINES (optional — add when ready) ════════════════
+
+# pipelines:
+#   - name: pdf-ingest
+#     namespace: vast-dataengine                 # default = k8s.namespaces[0]
+#     triggers:
+#       - name:               new-pdf
+#         type:               Element            # Element | Schedule
+#         events:             [ObjectCreated:*]  # S3-style events, NOT ElementCreated
+#         source_bucket_name: raw-pdfs           # existing S3 view's bucket name
+#         topic_name:         new-pdf-topic      # auto-created in broker if missing
+#         config:
+#           name_filters: { suffixes: [.pdf] }
+#         # broker auto-derived: {type: Internal, name: <broker_view.bucket>}
+#     functions:
+#       - name:            parse-pdf
+#         artifact_source: docker.io/myorg/parse-pdf
+#         image_tag:       v1.0                  # NEVER "latest"
+#         runtime:         python-3.11           # python-3.6 … 3.11
+#         architecture:    x86                   # x86 | arm
+#         # container_registry_vrn auto-derived from registry.name above
+#     # flow auto-derived: trigger → function, in declaration order

@@ -21,8 +21,9 @@ import structlog
 
 from vastde_orch.clients.vastde_cli import VastdeCli, VastdeContext
 from vastde_orch.clients.vms import VmsClient
-from vastde_orch.config.loader import ConfigError, load_config
+from vastde_orch.config.loader import ConfigError, load_any_config, load_config
 from vastde_orch.config.models import VastdeConfig
+from vastde_orch.config.models_minimal import VastdeMinimalConfig
 from vastde_orch.enablement.enable import disable_dataengine, enable_dataengine
 from vastde_orch.interactive._tty import require_tty
 from vastde_orch.interactive._vms_probe import VmsProbe
@@ -41,12 +42,26 @@ from vastde_orch.pipelines.pipelines import ensure_pipeline
 log = structlog.get_logger()
 
 
-def _load(cfg_path: Path) -> VastdeConfig:
+def _load(cfg_path: Path) -> VastdeConfig | VastdeMinimalConfig:
     try:
-        return load_config(cfg_path)
+        return load_any_config(cfg_path)
     except ConfigError as exc:
         click.echo(f"config error: {exc}", err=True)
         sys.exit(2)
+
+
+def _require_full(cfg: VastdeConfig | VastdeMinimalConfig, command: str) -> VastdeConfig:
+    """Reject minimal-schema configs for commands not yet wired for it."""
+    if isinstance(cfg, VastdeMinimalConfig):
+        click.echo(
+            f"'{command}' does not yet support the minimal schema "
+            "(sample/vastde.template.yaml).\n"
+            "  Use the full schema (sample/demo_tenant.yaml shape) for now, "
+            "or run 'vastde-orch wizard' to author one.",
+            err=True,
+        )
+        sys.exit(2)
+    return cfg
 
 
 def _build_vms(cfg: VastdeConfig, dry_run: bool) -> VmsClient:
@@ -84,9 +99,19 @@ def validate(cfg_path: Path) -> None:
     """Schema-check the YAML, including cross-refs (flow edges, k8s_cluster, etc.)."""
     cfg = _load(cfg_path)
     click.echo(f"OK: {cfg_path}")
-    click.echo(f"  - tenant: {cfg.vms.tenant}")
-    click.echo(f"  - enablement: {'present' if cfg.enablement else 'absent'}")
-    click.echo(f"  - pipelines: {len(cfg.pipelines)}")
+    if isinstance(cfg, VastdeMinimalConfig):
+        click.echo("  - schema: minimal (tenant-scoped)")
+        click.echo(f"  - tenant: {cfg.vms.tenant_name}")
+        click.echo(f"  - vip pool: {cfg.vip_pool_name}")
+        click.echo(f"  - k8s cluster: {cfg.k8s.name} ({cfg.k8s.kube_api_url})")
+        click.echo(f"  - registry: {cfg.registry.name} ({cfg.registry.url})")
+        click.echo(f"  - broker view: {cfg.broker_view.path} (bucket {cfg.broker_view.bucket})")
+        click.echo(f"  - pipelines: {len(cfg.pipelines)}")
+    else:
+        click.echo("  - schema: full")
+        click.echo(f"  - tenant: {cfg.vms.tenant}")
+        click.echo(f"  - enablement: {'present' if cfg.enablement else 'absent'}")
+        click.echo(f"  - pipelines: {len(cfg.pipelines)}")
 
 
 # ── enable (Stage A) ────────────────────────────────────────────────────────
@@ -114,7 +139,7 @@ def enable(
     skip_k8s_bootstrap: bool,
 ) -> None:
     """Stage A: enable DataEngine on the tenant."""
-    cfg = _load(cfg_path)
+    cfg = _require_full(_load(cfg_path), "enable")
     if cfg.enablement is None:
         click.echo("config has no `enablement:` section", err=True)
         sys.exit(2)
@@ -184,7 +209,7 @@ def apply(
     no_deploy: bool,
 ) -> None:
     """Stage B: reconcile pipelines."""
-    cfg = _load(cfg_path)
+    cfg = _require_full(_load(cfg_path), "apply")
     targets = [p for p in cfg.pipelines if not only_names or p.name in only_names]
     if not targets:
         click.echo("no pipelines selected", err=True)
@@ -237,7 +262,7 @@ def apply(
 @click.option("-c", "--config", "cfg_path", required=True, type=click.Path(exists=True, path_type=Path))
 def status(cfg_path: Path) -> None:
     """Show live pipeline status from VMS."""
-    cfg = _load(cfg_path)
+    cfg = _require_full(_load(cfg_path), "status")
     cli = _build_vastde_cli(cfg, dry_run=False)
     for p in cfg.pipelines:
         live = cli.pipelines_get(p.name)
@@ -259,7 +284,7 @@ def destroy(
     cfg_path: Path, only_names: tuple[str, ...], include_enablement: bool, yes: bool
 ) -> None:
     """Tear down pipelines (and optionally the enablement)."""
-    cfg = _load(cfg_path)
+    cfg = _require_full(_load(cfg_path), "destroy")
     if not yes:
         click.confirm("Really destroy these resources?", abort=True)
 
@@ -292,7 +317,7 @@ def function() -> None:
 @click.option("-c", "--config", "cfg_path", required=True, type=click.Path(exists=True, path_type=Path))
 def function_build(name: str, cfg_path: Path) -> None:
     """Build and push a single function image (inner-loop)."""
-    cfg = _load(cfg_path)
+    cfg = _require_full(_load(cfg_path), "function build")
     for pipeline in cfg.pipelines:
         for f in pipeline.functions:
             if f.name == name:
@@ -309,7 +334,7 @@ def function_build(name: str, cfg_path: Path) -> None:
 @click.option("-c", "--config", "cfg_path", required=True, type=click.Path(exists=True, path_type=Path))
 def function_tag(name: str, cfg_path: Path) -> None:
     """Print the content-hash tag a function would receive (for CI use)."""
-    cfg = _load(cfg_path)
+    cfg = _require_full(_load(cfg_path), "function tag")
     for pipeline in cfg.pipelines:
         for f in pipeline.functions:
             if f.name == name:

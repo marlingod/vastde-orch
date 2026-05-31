@@ -1,0 +1,38 @@
+# Live-test config: gt-tenant on var203.selab.vastdata.com
+# Required env vars: TENANT_ADMIN_USER, TENANT_ADMIN_PASSWORD, REGISTRY_USER, REGISTRY_PASSWORD
+
+vms:
+  address: var203.selab.vastdata.com
+  tenant_name: gt-tenant
+  auth:
+    user_env: TENANT_ADMIN_USER
+    password_env: TENANT_ADMIN_PASSWORD
+
+vip_pool_name: gt-vipool
+
+identity:
+  group:
+    name: gt-de-users
+    gid: 85500
+  bucket_owner:
+    name: gt-de-owner
+    uid: 85500
+    leading_gid: 85500
+    allow_create_bucket: true
+
+broker_view:
+  path: /gt-de-broker
+  bucket: gt-de-broker
+
+k8s:
+  name: gt-k8s-cluster
+  kube_api_url: https://10.143.2.242:6443
+  mtls:
+    name: gt-k8s-mtls
+    ca_cert_file:     /tmp/nc-test-certs/ca.pem
+    client_cert_file: /tmp/nc-test-certs/client.pem
+    client_key_file:  /tmp/nc-test-certs/client.key
+
+registry:
+  name: gt-dockerhub
+  url: docker.io

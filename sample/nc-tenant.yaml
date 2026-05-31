@@ -1,0 +1,36 @@
+# Live-test config: nc-tenant on var203.selab.vastdata.com
+# Required env vars: TENANT_ADMIN_USER, TENANT_ADMIN_PASSWORD, REGISTRY_USER, REGISTRY_PASSWORD
+
+vms:
+  address: var203.selab.vastdata.com
+  tenant_name: nc-tenant
+  auth:
+    user_env: TENANT_ADMIN_USER
+    password_env: TENANT_ADMIN_PASSWORD
+
+vip_pool_name: nc-vipool
+
+identity:
+  group:
+    name: nc-de-users
+    gid: 75500
+  bucket_owner:
+    name: nc-de-owner
+    uid: 75500
+    leading_gid: 75500
+    allow_create_bucket: true
+
+broker_view:
+  path: /nc-de-broker
+  bucket: nc-de-broker
+
+k8s:
+  kube_api_url: https://10.143.2.242:6443
+  mtls:
+    name: nc-k8s-mtls
+    ca_cert_file:     /tmp/nc-test-certs/ca.pem
+    client_cert_file: /tmp/nc-test-certs/client.pem
+    client_key_file:  /tmp/nc-test-certs/client.key
+
+registry:
+  url: docker.io
