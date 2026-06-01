@@ -1,0 +1,72 @@
+# test-tenant.yaml — FULL schema for `vastde-orch enable` on tenant dc-tenant.
+# Validate:  vastde-orch validate -c sample/test-tenant.yaml
+# Plan:      vastde-orch enable   -c sample/test-tenant.yaml --plan
+# Apply:     vastde-orch enable   -c sample/test-tenant.yaml
+#
+# Requires in .env: VMS_USER, VMS_PASSWORD, REGISTRY_USER, REGISTRY_PASSWORD,
+# TENANT_ADMIN_PASSWORD.  (Fix the VVMS_PASSWORD typo in .env first.)
+
+vms:
+  address: var203.selab.vastdata.com
+  tenant: dc-tenant
+  user:     ${VMS_USER}            # cluster-admin VMS creds (bootstrap needs cluster scope)
+  password: ${VMS_PASSWORD}
+
+enablement:
+  tenant:
+    name: dc-tenant
+    create_if_missing: false       # tenant already exists
+
+  event_broker:
+    kind: vast
+    view_path:   /dc-de-broker
+    bucket_name: dc-de-broker
+    bucket_owner: dc-de-owner      # must match a user under identity.users below
+    view_policy: dataengine-default
+    vip_pool:
+      name: dc-vipool
+      cidr: '24'
+      ip_range:
+        - 172.200.203.31
+        - 172.200.203.33
+    default_topic:
+      name: dc-default
+      partitions: 16
+      retention_hours: 24
+    deadletter_topic:
+      name: dc-dlq
+      partitions: 4
+      retention_hours: 24
+
+  container_registry:
+    name: dc-dockerhub
+    base_url: docker.io
+    auth:
+      method: user_credentials
+      username_env: REGISTRY_USER
+      password_env: REGISTRY_PASSWORD
+
+  kubernetes:
+    name: dc-k8s-cluster
+    api_server: https://10.143.2.247:6443
+    ca_cert_path:     /Users/yemalin.godonou/Documents/vast/dataengine/sample/kube-creds/ca.b64
+    client_cert_path: /Users/yemalin.godonou/Documents/vast/dataengine/sample/kube-creds/client-cert.b64
+    client_key_path:  /Users/yemalin.godonou/Documents/vast/dataengine/sample/kube-creds/key-client.b64
+    namespaces: [vast-dataengine]
+    zarf_package_path: ./packages/zarf-package-dataengine-amd64-1.0.0.tar.zst
+    zarf_init_path:    ./packages/zarf-init-amd64-v0.60.0.tar.zst
+
+  identity:
+    group:
+      name: dc-de-users
+      gid: 75500                   # TODO: confirm a free GID on the tenant
+      provider: vast
+    users:
+      - name: dc-de-owner          # bucket_owner referenced by event_broker
+        uid: 75500
+    policy: assign_predefined
+    tenant_admin:
+      username: dc-tenant          # value of TENANT_ADMIN_USER in .env
+      password_env: TENANT_ADMIN_PASSWORD
+
+  source_views: []                 # add later when you have raw-data views to wire up

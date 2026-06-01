@@ -18,5 +18,7 @@ venv/
 packages/
 # Sample/lab artifacts that reference live infra — exclude from git
 sample/demo_tenant.yaml*
+# mTLS credentials for live k8s cluster — never commit
+sample/kube-creds/
 # Coverage artifacts
 .coverage*
