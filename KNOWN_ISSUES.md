@@ -76,23 +76,57 @@ If that prints nothing on the target cluster, the gap exists there too.
 
 **Discovered on:** 2026-06-01 enabling DataEngine on `dc-tenant` (var203). Both gaps cause the orchestrator to fail or behave inconsistently in ways that aren't visible to the YAML author until the run is already mid-flight.
 
-### TODO 1 — `kubernetes.storage_class` is missing from the schema
+### TODO 1 — Capability-based `kubernetes` block (zarf + storage prereqs)
 
-**What's missing:** `src/vastde_orch/config/models.py:KubernetesSpec` has no `storage_class` field, yet `src/vastde_orch/clients/kube.py:zarf_init()` accepts a `storage_class` keyword arg and emits `--storage-class=<name>` when set. There's no way to plumb the value through from YAML.
+**What's missing:** The current `KubernetesSpec` is mostly raw connection data plus package file paths. The two cluster-side prerequisites that actually need to exist before `vastde compute-clusters link` can succeed — Zarf and a default StorageClass — are implicit, undetected, and unmanaged. When either is absent the orchestrator hangs for ~15 minutes and dies with `context deadline exceeded`.
 
-**Why it matters:** Vanilla kubeadm clusters ship with **no default StorageClass**. The `zarf init` step deploys a docker-registry chart whose PVC `zarf-docker-registry` then sits `Pending`, the registry pods never schedule, and after 15 minutes `zarf init` fails with `context deadline exceeded` on `zarf-seed-registry`. There is nothing in the YAML to warn the operator.
+**Why it matters:**
+- Vanilla kubeadm clusters ship with **no default StorageClass**. zarf's docker-registry PVC sits `Pending`, registry pods never schedule, `zarf init` times out on `zarf-seed-registry`. The VAST KB (`Enabling DataEngine on a VAST Cluster Tenant`) calls this out explicitly:
+  > The above call assumes that a default storage class exists. Otherwise, add the `--storage-class` option to the call. For example `--storage-class=local-path`.
+- Re-runs need to detect "zarf is already installed" (currently handled by `kubectl_namespace_exists("zarf", ...)` in `k8s_bootstrap.py`) but the same idea should apply to storage so we don't double-install local-path-provisioner.
 
-The VAST KB (`Enabling DataEngine on a VAST Cluster Tenant`) explicitly calls this out:
-> The above call assumes that a default storage class exists. Otherwise, add the `--storage-class` option to the call. For example `--storage-class=local-path`.
+**Proposed model — capability blocks with `detect: true` and a typed installer choice:**
 
-**Proposed fix:**
-1. Add to `KubernetesSpec`:
-   ```python
-   storage_class: str | None = None  # passed to `zarf init --storage-class=`
-   ```
-2. Thread it through `enablement/k8s_bootstrap.py:bootstrap_k8s()` → `zarf_init(..., storage_class=spec.storage_class)`.
-3. Document in `config/vastde.example.yaml` and `sample/vastde.template.yaml` with an `# Optional` annotation pointing at the VAST KB.
-4. (Optional) In preflight, if `storage_class` is unset, check `kubectl get storageclass` and warn if there's no default — fail-fast beats 15-min zarf timeout.
+```yaml
+kubernetes:
+  name: dc-k8s-cluster
+  kube_api_url: https://10.143.2.247:6443
+  mtls: { ca_cert_file: …, client_cert_file: …, client_key_file: … }
+  namespaces: [vast-dataengine]
+
+  # Bootstrap zarf if not already present in the cluster
+  zarf:
+    detect: true                  # check `zarf` namespace; skip install if present
+    packages:
+      source: local               # local | download
+      # source: local — read from this repo's packages/ dir (default)
+      init_path:       ./packages/zarf-init-amd64-v0.60.0.tar.zst
+      dataengine_path: ./packages/zarf-package-dataengine-amd64-1.0.0.tar.zst
+      # source: download — fetch from a URL given by VAST SE
+      # version: v0.60.0
+      # release_url: https://github.com/zarf-dev/zarf/releases/download/{version}/zarf-init-amd64-{version}.tar.zst
+
+  # Ensure a usable default StorageClass exists
+  storage:
+    detect: true                  # if a default StorageClass exists, do nothing
+    provisioner: local-path       # local-path | vast-csi | none
+    # provisioner: vast-csi → see TODO 3 (install script provided by VAST SE)
+```
+
+**Semantics of `detect`:**
+- `detect: true` (default): run "does it exist?" check; install only if absent. Idempotent.
+- `detect: false`: skip the check entirely. Pair with the action implied by `source`/`provisioner`. Useful for "I've installed this out-of-band, don't touch".
+
+**Semantics of `source: download`:** the URL is trusted (provided by VAST SE). **No checksum validation.** Failure mode is a normal HTTP/TLS error. If `release_url` is unset, fall back to `source: local`.
+
+**Code changes required:**
+1. `src/vastde_orch/config/models.py:KubernetesSpec` — add nested `ZarfSpec` and `StorageSpec` Pydantic models (replacing the bare `zarf_init_path` / `zarf_package_path` fields, which become `zarf.packages.init_path` / `zarf.packages.dataengine_path`). Keep old fields as deprecated for one release.
+2. `src/vastde_orch/clients/kube.py` — add `kubectl_default_storageclass_exists()` and `install_local_path_provisioner()`; `zarf_init` already accepts `storage_class`, so just thread it through.
+3. `src/vastde_orch/enablement/k8s_bootstrap.py` — replace the current monolithic flow with a `detect → maybe install` block for each capability (zarf, storage).
+4. `clients/_shell.py` — if `source: download`, pull the URL with `curl -L --fail` into a temp dir; no checksum.
+5. Update `config/vastde.example.yaml` and `sample/vastde.template.yaml` with the new schema; provide a backward-compat note in `DECISIONS.md`.
+
+**Preflight bonus:** preflight should refuse to start if zarf is unavailable and `zarf.detect: false`, or if storage is unavailable and `storage.detect: false`. Fail-fast beats 15-min zarf timeouts.
 
 ### TODO 2 — `kubernetes.namespaces` default is inconsistent with the bootstrap code
 
@@ -113,6 +147,36 @@ The YAML field is effectively cosmetic on the bootstrap side — bootstrap ignor
    - **Keep bootstrap hardcoded but rename the YAML field** to `deploy_namespaces` (with the default still `[vast-dataengine]`) to make clear it controls only the DataEngine deploy-target list, not the bootstrap namespaces.
 2. Document the relationship between this field and the auto-labeled namespaces in `config/vastde.example.yaml`.
 3. Verify against VMS: does `vastde compute-clusters link` need all three namespaces, or does the operator handle the knative ones implicitly?
+
+---
+
+### TODO 3 — VAST CSI as a `storage.provisioner` option
+
+**What this is:** when `kubernetes.storage.provisioner: vast-csi`, install the VAST CSI driver onto the target cluster so DataEngine workloads can use VAST-backed persistent volumes (proper persistence; local-path is fine only for the dev / lab path).
+
+**Short-term shape (script-based):**
+
+```yaml
+kubernetes:
+  storage:
+    detect: true
+    provisioner: vast-csi
+    vast_csi:
+      install_script: ./scripts/install-vast-csi.sh
+      # script is provided by the VAST SE; trusted, no checksum
+      # script env can read VAST_*, KUBECONFIG, etc.
+```
+
+The orchestrator shells out to the script via `clients/_shell.py` (matching the project rule that all shell-outs go through `clients/`). The script is responsible for `kubectl apply`-ing the VAST CSI manifests, creating the StorageClass, and marking it default.
+
+**Long-term shape (zarf package):**
+
+Replace the script with a proper zarf package (`vast-csi-driver-amd64-v*.tar.zst`) deployed via `zarf package deploy`, matching how the DataEngine package itself is delivered. This keeps the operator-machine surface area to a single tool (zarf) and gives air-gapped installs the same offline guarantees.
+
+**Open questions for the VAST SE:**
+- Does the CSI installer need NFS client tools on the host OS? (CLAUDE.md says yes — make sure ansible playbook 02 installs `nfs-common` on all k8s nodes; already done.)
+- Which VIP pool does the CSI mount against? Is it the same as the broker's pool or a separate one?
+- Does the installer create the StorageClass with `is-default-class: true` or do we patch it afterwards?
 
 ---
 
