@@ -1,6 +1,70 @@
 # Enabling DataEngine on dc-tenant — end-to-end
 
-## Architecture
+## High-level architecture
+
+```mermaid
+flowchart LR
+    OP["Operator<br/>(Mac)"]
+    VMS[("VAST cluster<br/>(VMS)")]
+    K8S[("Kubernetes cluster")]
+
+    OP -- "1 · vastde-orch enable<br/>vastpy REST" --> VMS
+    OP -- "2 · scp + ssh<br/>zarf init / deploy" --> K8S
+    OP -- "3 · vastde CLI<br/>link cluster + registry" --> VMS
+    VMS -. "4 · mTLS<br/>register telemetry" .-> K8S
+
+    classDef stageB fill:#fef3c7,stroke:#92400e,color:#000
+    B["Stage B: functions · pipelines · triggers<br/>(vastde CLI · later)"]:::stageB
+    K8S --> B
+```
+
+Three actors. The operator drives everything; VMS holds tenant/identity/broker state; the k8s cluster runs the workloads. After link, VMS pushes telemetry config to the cluster over mTLS. Stage B (pipelines) is the next layer.
+
+## Workflow — order of operations
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Operator (Mac)
+    participant VMS as VAST cluster (VMS)
+    participant Mst as k8s master (Linux)
+    participant K8s as Kubernetes API
+
+    rect rgb(235, 245, 255)
+    Note over Op,VMS: Stage A1 — VMS bootstrap
+    Op->>VMS: vastde-orch enable (vastpy)
+    VMS-->>Op: tenant + group + user + role/manager<br/>+ broker view + s3policy<br/>+ dataengine toggle
+    end
+
+    rect rgb(240, 255, 240)
+    Note over Op,K8s: Stage A2 — cluster bootstrap
+    Op->>Mst: scp packages/{zarf, *.tar.zst}
+    Op->>Mst: ssh: kubectl apply local-path-provisioner
+    Mst->>K8s: default StorageClass = local-path
+    Op->>Mst: ssh: zarf init --storage-class=local-path
+    Mst->>K8s: zarf injector / seed-registry / agent
+    Op->>Mst: ssh: zarf package deploy dataengine
+    Mst->>K8s: keda · knative · vast-operator-controller<br/>· vast-telemetries-collector × 5
+    end
+
+    rect rgb(255, 248, 235)
+    Note over Op,K8s: Stage A3 — link VMS ↔ k8s
+    Op->>VMS: vastde setup-dataengine --vip-pools <id>
+    Op->>VMS: vastde compute-clusters link (cluster-admin)
+    VMS->>K8s: mTLS · provision telemetry resources
+    Op->>VMS: vastde container-registries link
+    end
+
+    rect rgb(254, 243, 199)
+    Note over Op,K8s: Stage B — workloads (next session)
+    Op->>VMS: vastde functions / pipelines / triggers
+    VMS->>K8s: schedule serverless workloads
+    end
+```
+
+Three rectangles in the workflow map to A1 (VMS state), A2 (cluster runtime), A3 (binding the two). Stage B is everything you build on top.
+
+## Detailed architecture
 
 ```mermaid
 flowchart TB
