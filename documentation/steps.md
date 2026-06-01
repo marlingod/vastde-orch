@@ -64,6 +64,79 @@ sequenceDiagram
 
 Three rectangles in the workflow map to A1 (VMS state), A2 (cluster runtime), A3 (binding the two). Stage B is everything you build on top.
 
+## End-to-end deployment flow
+
+> Target design including capability-based prereq handling (zarf detect/install, storage detect/install). See `KNOWN_ISSUES.md` TODO 1 — the capability blocks are not yet implemented in code, but the orchestrator already runs everything outside the yellow decision diamonds.
+
+```mermaid
+flowchart TD
+    YAML[/"vastde.yaml<br/>(+ .env)"/]
+    START([vastde-orch enable])
+    PRE{preflight}
+
+    subgraph A1["A1 · VMS state (vastpy)"]
+        direction TB
+        VMS_T["ensure tenant + vippool<br/>identity (group/user)<br/>role + manager (tenant admin)"]
+        VMS_B["create broker view<br/>(S3 + DATABASE + KAFKA)<br/>+ s3policy"]
+        VMS_TOG["POST /dataengine/<br/>setup-provisioning<br/>(JWT, --vip-pools)"]
+        VMS_T --> VMS_B --> VMS_TOG
+    end
+
+    subgraph A2["A2 · Cluster state (zarf + workloads)"]
+        direction TB
+        SD{"storage:<br/>default class<br/>present?"}
+        PV{"provisioner?"}
+        LP["install<br/>local-path-provisioner"]
+        VC["run VAST CSI<br/>install script"]
+
+        ZD{"zarf:<br/>'zarf' ns<br/>exists?"}
+        ZP{"packages.source?"}
+        ZL["read from<br/>./packages/"]
+        ZDL["download from<br/>SE-provided URL"]
+        ZI["zarf init<br/>--storage-class=&lt;name&gt;"]
+        NS["create + label 3 namespaces<br/>vast-dataengine · knative-eventing<br/>knative-serving"]
+        ZPD["zarf package deploy<br/>dataengine.tar.zst"]
+
+        SD -- no --> PV
+        SD -- yes --> ZD
+        PV -- local-path --> LP --> ZD
+        PV -- vast-csi --> VC --> ZD
+        ZD -- no --> ZP
+        ZD -- yes --> ZI
+        ZP -- local --> ZL --> ZI
+        ZP -- download --> ZDL --> ZI
+        ZI --> NS --> ZPD
+    end
+
+    subgraph A3["A3 · Bind (vastde CLI · cluster-admin)"]
+        direction TB
+        SDE["vastde setup-dataengine<br/>--vip-pools &lt;id&gt;"]
+        LC["vastde compute-clusters link"]
+        LR["vastde container-registries link"]
+        SDE --> LC --> LR
+    end
+
+    READY([DataEngine ready on tenant])
+    B(["Stage B (later):<br/>vastde functions / pipelines / triggers"])
+
+    YAML --> START --> PRE
+    PRE -- fail --> START
+    PRE -- ok --> A1
+    PRE -- ok --> A2
+    A1 --> A3
+    A2 --> A3
+    A3 --> READY --> B
+
+    classDef decision fill:#fef3c7,stroke:#92400e,color:#000
+    classDef install  fill:#dbeafe,stroke:#1e40af,color:#000
+    classDef stageB   fill:#f3e8ff,stroke:#6b21a8,color:#000
+    class SD,PV,ZD,ZP decision
+    class LP,VC,ZL,ZDL,ZI,ZPD,LC,LR,SDE,VMS_T,VMS_B,VMS_TOG,NS install
+    class B stageB
+```
+
+Reads top-down: YAML drives `enable`, preflight gates entry, then A1 (VMS) and A2 (cluster) proceed largely in parallel. A1 is straight-line vastpy calls; A2 is the capability-based detect-then-install design (yellow diamonds) for storage and zarf, both feeding into `zarf init → namespaces → package deploy`. A3 binds the two halves via cluster-admin `vastde` CLI calls, and the tenant is DataEngine-ready.
+
 ## Detailed architecture
 
 ```mermaid
