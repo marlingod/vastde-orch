@@ -1,0 +1,92 @@
+# Sample config for scripts/setup_tenant.py
+#
+# Usage:
+#   cp sample/tenant-setup.example.yaml tenant-setup.yaml
+#   # edit fields below
+#   python scripts/setup_tenant.py -c tenant-setup.yaml --plan   # dry-run
+#   python scripts/setup_tenant.py -c tenant-setup.yaml          # apply
+#
+# Env vars referenced via ${VAR} syntax must be set in your shell or .env:
+#   VMS_USER                — cluster-admin username
+#   VMS_PASSWORD            — cluster-admin password
+#   TENANT_ADMIN_PASSWORD   — password to set on the new tenant-admin manager
+#
+# What this creates (per VAST docs pages 11-15):
+#   1. Tenant            (name + optional domain)
+#   2. Group             (gid; bound to local_provider_id=1 by default)
+#   3. Bucket-owner user (uid, leading_group=<above>, allow_create_bucket=true)
+#   4. Tenant-admin role (with the 36 standard tenant-admin permissions)
+#   5. Tenant-admin manager (user_type=TENANT_ADMIN, password from env)
+#   6. VIP pool          (optional; auto-picks an unclaimed range if needed)
+#   7. View policies     (NFS + S3; names default to "<tenant>-nfs-policy"
+#                         and "<tenant>-s3-policy")
+#
+# All steps are idempotent — re-run is safe.
+
+vms:
+  address:  var203.selab.vastdata.com
+  user:     ${VMS_USER}
+  password: ${VMS_PASSWORD}
+
+tenant:
+  name:   nc-tenant
+  domain: nc                 # optional; used for tenant-scoped login URL
+
+identity:
+  # NOTE on local_provider_id:
+  #   VAST scopes users/groups to a tenant via the tenant's auto-created
+  #   local provider (e.g. tenant "nc-tenant" → provider "provider-nc-tenant").
+  #   By default this script reads `local_provider_id` from the tenant record
+  #   and uses it for both the group and the bucket_owner — so you don't
+  #   normally need to specify it. Override only if you want them on a
+  #   different (named) local provider on the same VAST cluster.
+  group:
+    name: nc-de-users
+    gid:  75500
+    # local_provider_id: 6   # default = tenant's auto-created local provider
+
+  bucket_owner:
+    name:                 nc-de-owner
+    uid:                  75500
+    allow_create_bucket:  true
+    allow_delete_bucket:  true
+    # local_provider_id: 6   # default = tenant's auto-created local provider
+    # leading_group is auto-set to identity.group.name
+
+# Tenant-admin role + manager are ALWAYS created after the tenant.
+# The whole tenant_admin block is optional — defaults below kick in if absent.
+tenant_admin:
+  # name defaults to "<tenant>-admin" (e.g. "nc-tenant" → "nc-tenant-admin")
+  name:          nc-admin
+  # password resolution: this field → $TENANT_ADMIN_PASSWORD env var (fatal if neither)
+  password:      ${TENANT_ADMIN_PASSWORD}
+  first_name:    nc                  # optional
+  last_name:     admin               # optional
+  # role_name defaults to "<tenant>-admin-role"
+  # permissions default to the 9 realms × 4 actions set (36 perms)
+
+# View policies (step 7) are ALWAYS created — the block is optional only for
+# overriding names or flavors.
+view_policies:
+  nfs:
+    # name defaults to "<tenant>-nfs-policy" (e.g. "nc-tenant" → "nc-tenant-nfs-policy")
+    name:   nc-nfs-policy
+    # flavor: NFS | SMB | S3_NATIVE | MIXED_LAST_WINS (default: NFS)
+    # flavor: NFS
+  s3:
+    # name defaults to "<tenant>-s3-policy"
+    name:   nc-s3-policy
+    # flavor: S3_NATIVE (default — required for views containing DATABASE protocol)
+    # flavor: S3_NATIVE
+
+vip_pool:                            # OPTIONAL — omit this whole block to skip step 6
+  name:    nc-vip-pool
+  cidr:    172.200.204.0/24          # subnet to allocate IPs from (must be reachable from VAST)
+  role:    PROTOCOLS                 # default PROTOCOLS; other: NVME_HOST, FAULT_DOMAIN
+  # ip_range is OPTIONAL. Leave it commented to auto-pick a free range.
+  # If specified BUT overlaps an existing pool's range, the script warns and falls back
+  # to auto-pick (does NOT error — first-come-first-served against live VMS).
+  # ip_range:
+  #   start: 172.200.204.180
+  #   end:   172.200.204.182
+  default_size: 3                    # IPs to allocate when auto-picking (default 3)

@@ -41,15 +41,74 @@ class EnsureOutcome:
     drift: dict[str, Any]  # fields that differed (empty for CREATED/UNCHANGED)
 
 
+def _extract_id(value: Any) -> Any:
+    """Extract `.id` from a nested object, e.g. {"id": 6, "name": "..."} → 6."""
+    if isinstance(value, dict):
+        return value.get("id")
+    return value
+
+
+def _extract_id_list(value: Any) -> Any:
+    """Extract `.id` from each item, e.g. [{"id": 27, ...}] → [27]."""
+    if isinstance(value, list):
+        return [_extract_id(item) for item in value]
+    return value
+
+
+# Map WRITE field name → (READ field name, optional extractor for nested shape).
+# VAST's API returns several fields under different names or shapes than what
+# POST/PATCH accepts; without this map every re-run reports spurious drift on
+# those fields. Add new entries here whenever you spot a write/read mismatch.
+_OBSERVED_FIELD: dict[str, tuple[str, Any]] = {
+    "leading_group":     ("leading_group_name", None),
+    "local_provider_id": ("local_provider",      _extract_id),
+    "roles":             ("roles",               _extract_id_list),
+    "role_ids":          ("roles",               _extract_id_list),
+}
+
+
+def _values_equal(desired: Any, observed: Any) -> bool:
+    """True if `desired` and `observed` represent the same value.
+
+    Beyond `==`, also returns True for common numeric-string mismatches the
+    VAST API exhibits (e.g. POST `subnet_cidr='24'` is read back as int `24`).
+    """
+    if desired == observed:
+        return True
+    if isinstance(desired, str) and isinstance(observed, int):
+        try:
+            return int(desired) == observed
+        except (ValueError, TypeError):
+            return False
+    if isinstance(desired, int) and isinstance(observed, str):
+        try:
+            return desired == int(observed)
+        except (ValueError, TypeError):
+            return False
+    return False
+
+
 def _drift(desired: dict[str, Any], observed: dict[str, Any]) -> dict[str, Any]:
     """Return only the keys in `desired` whose value differs from observed.
+
+    Handles three VAST API quirks that previously caused spurious drift:
+      1. Field-name aliases — POST `leading_group`, read `leading_group_name`.
+         Mapped via `_OBSERVED_FIELD`.
+      2. Nested-object extraction — POST `local_provider_id=6`, read
+         `local_provider={"id": 6, ...}`. Extractor handles the unwrap.
+      3. String/int coercion — POST `subnet_cidr='24'`, read `24`. Handled
+         by `_values_equal`.
 
     Lists are compared element-wise (order-sensitive — VAST APIs are
     order-sensitive for lists like protocols=['NFS','SMB']).
     """
     out: dict[str, Any] = {}
     for k, v in desired.items():
-        if observed.get(k) != v:
+        read_key, extractor = _OBSERVED_FIELD.get(k, (k, None))
+        obs_val = observed.get(read_key)
+        if extractor is not None and obs_val is not None:
+            obs_val = extractor(obs_val)
+        if not _values_equal(v, obs_val):
             out[k] = v
     return out
 
@@ -269,9 +328,17 @@ class VmsClient:
         """Create a group. VAST API requires local_provider_id (default 1 = the
         default VAST provider). The `provider` kwarg is kept for backward
         compatibility but only the local_provider_id is sent.
+
+        VAST treats group fields (name, gid, local_provider_id) as immutable
+        after creation — PATCHing local_provider_id raises 409 ("Cannot update
+        group's Local Provider"). Pass `patchable_fields=set()` so post-create
+        runs report UNCHANGED instead of trying to mutate immutable fields.
         """
         spec = {"name": name, "gid": gid, "local_provider_id": local_provider_id}
-        return self.ensure("groups", key_field="name", key_value=name, spec=spec)
+        return self.ensure(
+            "groups", key_field="name", key_value=name, spec=spec,
+            patchable_fields=set(),
+        )
 
     def ensure_user(
         self,
@@ -284,6 +351,10 @@ class VmsClient:
         allow_create_bucket: bool = True,
         allow_delete_bucket: bool = True,
     ) -> EnsureOutcome:
+        """Create a user. Immutable fields (name, uid, local_provider_id) are
+        sent on POST but excluded from PATCH via patchable_fields. Bucket-perm
+        flags and leading_group ARE mutable.
+        """
         spec: dict[str, Any] = {
             "name": name,
             "uid": uid,
@@ -293,7 +364,12 @@ class VmsClient:
         }
         if leading_group:
             spec["leading_group"] = leading_group
-        return self.ensure("users", key_field="name", key_value=name, spec=spec)
+        return self.ensure(
+            "users", key_field="name", key_value=name, spec=spec,
+            patchable_fields={
+                "allow_create_bucket", "allow_delete_bucket", "leading_group",
+            },
+        )
 
     def ensure_k8scluster(
         self, name: str, *, api_server: str, tenant_id: int

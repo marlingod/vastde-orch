@@ -46,15 +46,34 @@ def provision_vast_broker(
     vippool = vms.get_or_placeholder("vippools", key_field="name", key_value=spec.vip_pool.name)
 
     # 3. View policy with bucket listing perm to the DE group.
-    plan.record(
-        vms.ensure_viewpolicy(
-            spec.view_policy,
-            tenant_id=tenant_id,
-            security_flavor="S3_NATIVE",
-            bucket_listing_groups=[dataengine_group],
+    #    Reuse an existing S3_NATIVE policy on this tenant if one is already
+    #    there (e.g. created by `scripts/setup_tenant.py` at tenant bootstrap).
+    #    Avoids duplicating policies for the same tenant.
+    policy = _pick_s3_native_policy(vms, tenant_id, spec.view_policy)
+    if policy is None:
+        plan.record(
+            vms.ensure_viewpolicy(
+                spec.view_policy,
+                tenant_id=tenant_id,
+                security_flavor="S3_NATIVE",
+                bucket_listing_groups=[dataengine_group],
+            )
         )
-    )
-    policy = vms.get_or_placeholder("viewpolicies", key_field="name", key_value=spec.view_policy)
+        policy = vms.get_or_placeholder(
+            "viewpolicies", key_field="name", key_value=spec.view_policy,
+        )
+    else:
+        listing = policy.get("s3_bucket_listing_groups") or []
+        if dataengine_group not in listing:
+            # The reused policy doesn't list the DE group for bucket listing.
+            # The broker view will still work; only s3:ListAllMyBuckets is
+            # affected. Surface as a non-fatal warning rather than mutating
+            # a tenant-owned policy out from under the operator.
+            print(
+                f"  WARN: reusing existing view policy {policy['name']!r} but "
+                f"its s3_bucket_listing_groups does not include {dataengine_group!r}. "
+                "DE group will not see buckets via s3:ListAllMyBuckets until added."
+            )
 
     # 4. Kafka broker view. Must include S3 and DATABASE alongside KAFKA per
     #    VAST 5.4 — the broker is realized as a single view with all three
@@ -119,6 +138,33 @@ def provision_kafka_broker(
         )
     )
     return plan
+
+
+def _pick_s3_native_policy(
+    vms: VmsClient, tenant_id: int, preferred_name: str,
+) -> dict | None:
+    """Return an S3_NATIVE view policy already on the tenant, or None.
+
+    Preference order:
+      1. A policy whose name == preferred_name (lets operators be explicit
+         by naming the tenant's existing policy in vastde.yaml).
+      2. The first S3_NATIVE policy on the tenant.
+
+    Returns None if no S3_NATIVE policy exists for this tenant — caller
+    should create one.
+    """
+    try:
+        all_policies = list(vms.raw.viewpolicies.get())
+    except Exception:
+        return None  # if listing fails, fall through to the create path
+    matches = [
+        p for p in all_policies
+        if p.get("tenant_id") == tenant_id and p.get("flavor") == "S3_NATIVE"
+    ]
+    if not matches:
+        return None
+    by_name = next((p for p in matches if p.get("name") == preferred_name), None)
+    return by_name or matches[0]
 
 
 def get_broker_view_id(vms: VmsClient, spec: VastEventBrokerSpec | KafkaEventBrokerSpec) -> int | None:
