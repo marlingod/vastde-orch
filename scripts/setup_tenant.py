@@ -13,6 +13,19 @@ DataEngine docs (pages 11-15):
     6. VIP pool          (optional; auto-picks an unclaimed range if needed)
     7. View policies     (NFS + S3, always created; names default to
                           "<tenant>-nfs-policy" and "<tenant>-s3-policy")
+    8. DataEngine identity policy + group binding (always created + bound).
+                          Matches the official VAST KB doc's `data-engine-
+                          <tenant>` policy verbatim, but under a non-reserved
+                          name (default `<tenant>-de-write`) since the
+                          official name is reserved by VMS — it can only be
+                          created via the Web UI "Assign DataEngine identity
+                          policy to group" checkbox. Grants Create{Trigger,
+                          Function,Pipeline} (which per KB note implicitly
+                          grants Update/Get/Delete on user-owned resources).
+    9. (Opt-in) Bind group to `AllowAllTabular` — VAST's auto-created
+                          policy with broader S3 + Kafka access. Off by
+                          default; not required for DataEngine per the KB
+                          doc. Enable via dataengine_policy.attach_allow_all_tabular.
 
 Idempotent: every step is `get → create-or-patch → no-op`. Safe to re-run.
 
@@ -42,6 +55,7 @@ import yaml
 try:
     from vastde_orch.clients.vms import VmsClient
     from vastde_orch.config.models import VmsSpec
+    from vastde_orch.enablement.identity import build_dataengine_policy_doc
     from vastde_orch.reconciler import Plan
     from vastde_orch.vippool_planner import (
         claimed_per_subnet,
@@ -312,6 +326,109 @@ def main() -> int:
     )
     plan.record(out)
     print(f"  {out.result.value}: {out.resource}/{out.name}")
+
+    # ── 8. DataEngine identity policy + group binding ─────────────────────
+    # Per the VAST KB "Provisioning User Access and Permissions for DataEngine"
+    # (docs/provision-user.pdf p.5-7), application users need ONE identity
+    # policy granting Create{Trigger,Function,Pipeline} to perform DataEngine
+    # tasks. The doc's recommended name is `data-engine-<tenant>` — auto-
+    # created by enabling "Assign DataEngine identity policy to group" in the
+    # Web UI when editing the tenant. That name is RESERVED by VMS — POSTing
+    # it manually returns 403 ("is reserved. Please, use a different name").
+    # So this script creates an equivalent policy under a non-reserved name
+    # (default `<tenant>-de-write`) using the IDENTICAL policy document — the
+    # one in vastde_orch.enablement.identity.build_dataengine_policy_doc(),
+    # which matches the KB's verbatim example (Sids DataengineTablesAccess +
+    # DataEngineDefault, same Actions + Resources).
+    #
+    # Per the KB note on p.7: Create* implicitly grants Update/Get/Delete on
+    # resources the user CREATED, so Create*-only is sufficient for self-
+    # managed pipelines. Add explicit Update/Get/Delete via a separate policy
+    # if you need cross-user management.
+    #
+    # Binding: VMS makes /s3policies/{id}/.groups read-only — PATCHing it
+    # silently no-ops. Bind from the GROUP side via
+    # /groups/{id}/.s3_policies_ids. Verified live on var203 2026-06-07.
+    dep_cfg = cfg.get("dataengine_policy") or {}
+    dep_group = dep_cfg.get("group") or g["name"]
+    write_name = (dep_cfg.get("name") or dep_cfg.get("write_policy_name")
+                  or f"{t['name']}-de-write")
+    print(f"\n── 8. DataEngine identity policy {write_name!r} + bind to {dep_group!r} ──")
+    pol_matches = [
+        p for p in vms.raw.s3policies.get()
+        if p.get("tenant_id") == tenant_id and p.get("name") == write_name
+    ]
+    if pol_matches:
+        write_pol_id = pol_matches[0]["id"]
+        print(f"  unchanged: s3policies/{write_name} (id={write_pol_id}) already exists")
+    elif args.plan:
+        write_pol_id = None
+        print(f"  would_create: s3policies/{write_name} "
+              f"(tenant_id={tenant_id}, actions=CreateTrigger/Function/Pipeline)")
+    else:
+        created = vms.raw.s3policies.post(
+            name=write_name,
+            tenant_id=tenant_id,
+            enabled=True,
+            policy=build_dataengine_policy_doc(),
+        )
+        write_pol_id = created["id"]
+        print(f"  created: s3policies/{write_name} (id={write_pol_id})")
+
+    # Bind to DE group (group-side PATCH; /s3policies/.groups is read-only).
+    if write_pol_id is not None:
+        group_record = next(
+            (gr for gr in vms.raw.groups.get() if gr.get("name") == dep_group),
+            None,
+        )
+        if group_record:
+            existing_ids = group_record.get("s3_policies_ids") or []
+            if write_pol_id in existing_ids:
+                print(f"  unchanged: group {dep_group} already bound to {write_name}")
+            else:
+                new_ids = existing_ids + [write_pol_id]
+                if args.plan:
+                    print(f"  would_update: groups/{dep_group}.s3_policies_ids "
+                          f"{existing_ids} → {new_ids}  (binding {write_name})")
+                else:
+                    vms.raw.groups[group_record["id"]].patch(s3_policies_ids=new_ids)
+                    print(f"  updated: groups/{dep_group}.s3_policies_ids = {new_ids}")
+
+    # ── 9. (Optional) Attach AllowAllTabular ──────────────────────────────
+    # AllowAllTabular is auto-created by VAST when DataEngine is enabled,
+    # but is NOT mentioned in the KB DataEngine provisioning doc — it grants
+    # broader access (`s3:*` on `*`, `*` on all kafka topics) than DataEngine
+    # itself requires. The official DataEngine identity policy (step 8 above)
+    # is sufficient on its own. Opt in here ONLY if your users need the
+    # broader S3/Kafka access (e.g. interacting with non-DE buckets).
+    if dep_cfg.get("attach_allow_all_tabular", False):
+        aat_name = dep_cfg.get("allow_all_tabular_name", "AllowAllTabular")
+        print(f"\n── 9. (opt-in) Bind {dep_group!r} to {aat_name!r} ──")
+        aat_matches = [
+            p for p in vms.raw.s3policies.get()
+            if p.get("tenant_id") == tenant_id and p.get("name") == aat_name
+        ]
+        if not aat_matches:
+            print(f"  skipped: s3policies/{aat_name} not found "
+                  "(it's auto-created by VAST when DE is enabled via Web UI)")
+        else:
+            aat_id = aat_matches[0]["id"]
+            group_record = next(
+                (gr for gr in vms.raw.groups.get() if gr.get("name") == dep_group),
+                None,
+            )
+            if group_record:
+                existing_ids = group_record.get("s3_policies_ids") or []
+                if aat_id in existing_ids:
+                    print(f"  unchanged: group {dep_group} already bound to {aat_name}")
+                else:
+                    new_ids = existing_ids + [aat_id]
+                    if args.plan:
+                        print(f"  would_update: groups/{dep_group}.s3_policies_ids "
+                              f"{existing_ids} → {new_ids}")
+                    else:
+                        vms.raw.groups[group_record["id"]].patch(s3_policies_ids=new_ids)
+                        print(f"  updated: groups/{dep_group}.s3_policies_ids = {new_ids}")
 
     # ── Summary ────────────────────────────────────────────────────────────
     # Scrub sensitive fields from rendered output (password, secret, token).

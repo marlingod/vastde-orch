@@ -20,6 +20,11 @@
 #   6. VIP pool          (optional; auto-picks an unclaimed range if needed)
 #   7. View policies     (NFS + S3; names default to "<tenant>-nfs-policy"
 #                         and "<tenant>-s3-policy")
+#   8. DataEngine identity policy + binding (always; matches the official
+#                         KB doc's data-engine-<tenant> policy verbatim, under
+#                         a non-reserved name; bound to the DE group)
+#   9. (Opt-in) bind group to AllowAllTabular (broader S3+Kafka access,
+#                         not required for DE; default off)
 #
 # All steps are idempotent — re-run is safe.
 
@@ -78,6 +83,25 @@ view_policies:
     name:   nc-s3-policy
     # flavor: S3_NATIVE (default — required for views containing DATABASE protocol)
     # flavor: S3_NATIVE
+
+# Steps 8 + 9 — DataEngine identity policy + group binding.
+#
+# Step 8 always runs: creates the official DataEngine identity policy
+# (matches the KB doc `data-engine-<tenant>` verbatim) under a non-reserved
+# name (default `<tenant>-de-write`), then binds it to the DE group. This
+# grants Create{Trigger,Function,Pipeline} — sufficient for self-managed
+# DataEngine resources per the KB note.
+#
+# Step 9 is OPT-IN: also binds the group to VAST's auto-created
+# AllowAllTabular policy (broader S3 + Kafka access). Only needed if your
+# users interact with non-DataEngine buckets / topics.
+#
+# Defaults work for most cases — only define the block if you need overrides.
+# dataengine_policy:
+#   name:                       nc-de-write       # default = <tenant>-de-write
+#   group:                      nc-de-users       # default = identity.group.name
+#   attach_allow_all_tabular:   false             # default false; opt-in for step 9
+#   allow_all_tabular_name:     AllowAllTabular   # default; only matters if opt-in
 
 vip_pool:                            # OPTIONAL — omit this whole block to skip step 6
   name:    nc-vip-pool
