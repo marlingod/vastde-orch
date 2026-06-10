@@ -64,6 +64,46 @@ Standalone but related (different repos at the same parent):
 
 ---
 
+## Install (one-time, do this first)
+
+```bash
+git clone https://github.com/marlingod/vastde-orch
+cd vastde-orch
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"        # puts the `vastde-orch` CLI on your PATH
+```
+
+Verify it landed:
+```bash
+vastde-orch --version
+vastde-orch --help             # should list: validate, enable, apply, status,
+                               #              destroy, tenant, function, wizard
+```
+
+`vastde-orch` reads credentials from environment variables. Create `.env`
+in the repo root (it's gitignored):
+
+```bash
+cat > .env <<EOF
+# VMS connection — cluster-admin for tenant create, lookups
+VMS_USER=admin
+VMS_PASSWORD=<your cluster-admin password>
+
+# Optional — used by tenant create step 5 to set the manager password,
+# and by tenant enable for the /dataengine/ setup-provisioning call
+TENANT_ADMIN_PASSWORD=<password for the new tenant-admin>
+EOF
+```
+
+Source it before every session (or use a shell auto-loader like `direnv`):
+```bash
+set -a; source .env; set +a
+```
+
+> All `vastde-orch tenant ...` commands below assume you've done this once.
+
+---
+
 ## Pick your path
 
 | You want to… | Use |
