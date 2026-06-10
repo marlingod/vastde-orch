@@ -22,3 +22,6 @@ sample/demo_tenant.yaml*
 sample/kube-creds/
 # Coverage artifacts
 .coverage*
+# Per-function transient build outputs (vastde functions build writes build.log)
+functions/*/build.log
+functions/*/__pycache__/

@@ -1,0 +1,15 @@
+# Local development config for `vastde functions localrun`.
+#
+# DO NOT commit real credentials. Replace placeholders with values from your
+# operator environment, or source them at run time:
+#   source ~/.vast/<bucket-owner>.s3.env
+#   vastde functions localrun json-validate -c config.yaml
+#
+# At deployment time, these env vars come from VAST DataEngine's runtime
+# secret-injection (configured separately on the function resource).
+
+envs:
+  S3_ENDPOINT_URL:       "https://<TENANT_VIP>"      # e.g. https://172.200.203.128
+  AWS_ACCESS_KEY_ID:     "<REPLACE_ME>"              # from `vms.raw.users[<bucket_owner_id>].access_keys.post(tenant_id=<tid>)`
+  AWS_SECRET_ACCESS_KEY: "<REPLACE_ME>"              # only available at creation time — persist immediately
+  AWS_DEFAULT_REGION:    "us-east-1"

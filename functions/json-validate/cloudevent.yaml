@@ -1,0 +1,9 @@
+specversion: "1.0"
+type: "vast.element.created"
+source: "/usc-tenant/raw-json"
+id: "test-event-001"
+time: "2026-06-08T00:00:00Z"
+datacontenttype: "application/json"
+data:
+  bucket: "usc-raw-json"
+  key: "sample.json"

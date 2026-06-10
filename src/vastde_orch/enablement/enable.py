@@ -166,11 +166,12 @@ def enable_dataengine(
     return plan
 
 
-def disable_dataengine(vms: VmsClient, tenant_name: str, *, dry_run: bool = False) -> Plan:
+def disable_dataengine(vms: VmsClient, tenant_name: str) -> Plan:
     """Reverse of enable: toggle DataEngine off on the tenant (PDF p.39).
 
     Calls DELETE /dataengine/ with X-Tenant-Name set to the target tenant.
-    Requires a tenant-scoped credential.
+    Requires a tenant-scoped credential. Honors `vms._dry_run` — in dry-run
+    mode, records WOULD_DELETE without hitting the API.
 
     Auto-created views/policies (`/dataengine`, `/dataengine-telemetries-*`,
     and the auto view policies) are intentionally NOT deleted here — VAST
@@ -179,9 +180,15 @@ def disable_dataengine(vms: VmsClient, tenant_name: str, *, dry_run: bool = Fals
     """
     plan = Plan()
     tenant = vms.get_or_raise("tenants", key_field="name", key_value=tenant_name)
+    if vms._dry_run:
+        plan.record(EnsureOutcome(
+            result=DiffResult.WOULD_DELETE, resource="dataengine",
+            name=tenant_name, id=tenant["id"], drift={},
+        ))
+        return plan
     try:
         _tenant_scoped_raw(vms, tenant_name).dataengine.delete()
-        result = DiffResult.DELETED if not vms._dry_run else DiffResult.WOULD_DELETE
+        result = DiffResult.DELETED
     except Exception as exc:
         # Surface as no-op + warning rather than hard fail; the operator can
         # finish via the DataEngine Web UI.

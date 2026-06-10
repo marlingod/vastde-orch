@@ -612,11 +612,24 @@ class VmsClient:
                 raise
             return {"id": placeholder_id, key_field: key_value, "_placeholder": True}
 
-    def generate_s3_keys(self, user_id: int) -> dict[str, str]:
+    def generate_s3_keys(
+        self, user_id: int, *, tenant_id: int | None = None,
+    ) -> dict[str, str]:
         """Generate and return a new S3 access key pair for a user.
+
+        VMS rejects the POST without `tenant_id` in the body — error 400
+        ("It is required to provide `tenant_id` for S3 Data requests")
+        verified live on var203 2026-06-07. The wrapper now requires it;
+        the kwarg is keyword-only and defaults to None only to let dry-run
+        callers skip it.
 
         The secret key is only available at creation time; persist it immediately.
         """
         if self._dry_run:
             return {"access_key": "<dry-run>", "secret_key": "<dry-run>"}
-        return self._raw.users[user_id].access_keys.post()
+        if tenant_id is None:
+            raise ValueError(
+                "generate_s3_keys requires tenant_id (VMS rejects the POST "
+                "without it). Pass tenant_id=<int>."
+            )
+        return self._raw.users[user_id].access_keys.post(tenant_id=tenant_id)

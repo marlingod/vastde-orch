@@ -19,10 +19,19 @@ from typing import Any
 import click
 import structlog
 
+from vastde_orch.bootstrap.tenant import (
+    create_tenant,
+    destroy_tenant,
+    load_tenant_config,
+)
+from vastde_orch.bootstrap.tenant_enable import (
+    load_tenant_enable_config,
+    tenant_enable as run_tenant_enable,
+)
 from vastde_orch.clients.vastde_cli import VastdeCli, VastdeContext
 from vastde_orch.clients.vms import VmsClient
 from vastde_orch.config.loader import ConfigError, load_any_config, load_config
-from vastde_orch.config.models import VastdeConfig
+from vastde_orch.config.models import VastdeConfig, VmsSpec
 from vastde_orch.config.models_minimal import VastdeMinimalConfig
 from vastde_orch.enablement.enable import disable_dataengine, enable_dataengine
 from vastde_orch.interactive._tty import require_tty
@@ -279,30 +288,135 @@ def status(cfg_path: Path) -> None:
 @click.option("-c", "--config", "cfg_path", required=True, type=click.Path(exists=True, path_type=Path))
 @click.option("--only", "only_names", multiple=True, help="Limit to specific pipeline names.")
 @click.option("--include-enablement", is_flag=True, help="Also disable DataEngine on the tenant.")
+@click.option("--plan", is_flag=True, help="Dry-run — print what would be deleted, do not write.")
 @click.option("--yes", is_flag=True, help="Skip confirmation prompt.")
 def destroy(
-    cfg_path: Path, only_names: tuple[str, ...], include_enablement: bool, yes: bool
+    cfg_path: Path, only_names: tuple[str, ...], include_enablement: bool,
+    plan: bool, yes: bool,
 ) -> None:
     """Tear down pipelines (and optionally the enablement)."""
     cfg = _require_full(_load(cfg_path), "destroy")
-    if not yes:
+    if not plan and not yes:
         click.confirm("Really destroy these resources?", abort=True)
 
-    cli = _build_vastde_cli(cfg, dry_run=False)
+    verb = "would delete" if plan else "deleting"
+    cli = _build_vastde_cli(cfg, dry_run=plan)
     targets = [p for p in cfg.pipelines if not only_names or p.name in only_names]
 
     for p in targets:
-        click.echo(f"deleting pipeline {p.name}")
+        click.echo(f"{verb} pipeline {p.name}")
         cli.pipelines_delete(p.name)
         for t in p.triggers:
+            click.echo(f"  {verb} trigger {t.name}")
             cli.triggers_delete(t.name)
         for f in p.functions:
+            click.echo(f"  {verb} function {f.name}")
             cli.functions_delete(f.name)
 
     if include_enablement:
-        vms = _build_vms(cfg, dry_run=False)
-        click.echo(f"disabling DataEngine on tenant {cfg.vms.tenant}")
+        vms = _build_vms(cfg, dry_run=plan)
+        click.echo(f"{'would disable' if plan else 'disabling'} "
+                   f"DataEngine on tenant {cfg.vms.tenant}")
         disable_dataengine(vms, cfg.vms.tenant).render()
+
+    click.echo(f"\n{'DRY-RUN' if plan else 'DESTROYED'}: "
+               f"{len(targets)} pipeline(s){' + enablement' if include_enablement else ''}")
+
+
+# ── tenant subgroup ─────────────────────────────────────────────────────────
+# Cluster-admin tenant bootstrap. The counterpart to `enable` (which runs as
+# tenant-admin). Uses its own small YAML schema (sample/tenant-setup.example.yaml)
+# — NOT the full VastdeConfig schema — because most of what `enable` needs
+# (broker view, K8s registration, etc.) doesn't exist yet when bootstrapping.
+
+def _vms_for_bootstrap(cfg: dict[str, Any], *, dry_run: bool) -> VmsClient:
+    """Build a VmsClient from a tenant-setup OR tenant-enable YAML.
+
+    The tenant name lives at `vms.tenant` (enable schema) or at top-level
+    `tenant.name` (create schema). Accept either so both subcommands can share
+    this helper.
+    """
+    vms_cfg = cfg["vms"]
+    tenant_name = vms_cfg.get("tenant") or (cfg.get("tenant") or {}).get("name")
+    if not tenant_name:
+        sys.exit("FATAL: config must set vms.tenant or tenant.name")
+    return VmsClient(VmsSpec(
+        address=vms_cfg["address"],
+        user=vms_cfg["user"],
+        password=vms_cfg["password"],
+        tenant=tenant_name,
+    ), dry_run=dry_run)
+
+
+@main.group()
+def tenant() -> None:
+    """Cluster-admin tenant bootstrap (tenant + identity + DE policy)."""
+
+
+@tenant.command("create")
+@click.option("-c", "--config", "cfg_path", required=True,
+              type=click.Path(exists=True, path_type=Path))
+@click.option("--plan", is_flag=True,
+              help="Dry-run — print diff, do not write.")
+def tenant_create(cfg_path: Path, plan: bool) -> None:
+    """Create tenant + identity + role + manager + view policies + DE policy.
+
+    Idempotent; safe to re-run. Steps in order:
+      1. tenant  2. group  3. bucket-owner user  4. role  5. manager
+      6. (opt) vippool  7. nfs/s3 view policies  8. DE identity policy + bind
+      9. (opt) bind to AllowAllTabular
+    """
+    cfg = load_tenant_config(cfg_path)
+    vms = _vms_for_bootstrap(cfg, dry_run=plan)
+    sys.exit(create_tenant(cfg, vms))
+
+
+@tenant.command("destroy")
+@click.option("-c", "--config", "cfg_path", required=True,
+              type=click.Path(exists=True, path_type=Path))
+@click.option("--plan", is_flag=True,
+              help="Dry-run — print what would be deleted.")
+@click.option("--yes", is_flag=True,
+              help="Skip the interactive 'type destroy to confirm' prompt.")
+def tenant_destroy(cfg_path: Path, plan: bool, yes: bool) -> None:
+    """Strict inverse of `tenant create`. Refuses if a broker view still uses
+    the view policies (delete those with `vastde-orch destroy --include-enablement`).
+    """
+    cfg = load_tenant_config(cfg_path)
+    vms = _vms_for_bootstrap(cfg, dry_run=plan)
+    sys.exit(destroy_tenant(cfg, vms, yes=yes))
+
+
+@tenant.command("enable")
+@click.option("-c", "--config", "cfg_path", required=True,
+              type=click.Path(exists=True, path_type=Path))
+@click.option("--plan", is_flag=True,
+              help="Dry-run — print discovered state + planned changes, no mutations.")
+@click.option("--skip-k8s-bootstrap", is_flag=True, default=True,
+              help="Skip operator-machine sysctl/zarf checks (default True — assumes "
+                   "K8s is already prepared via the ansible playbook).")
+@click.option("--skip-preflight", is_flag=True,
+              help="Skip pre-flight checks entirely (kubectl/vastde/zarf).")
+def tenant_enable_cmd(
+    cfg_path: Path, plan: bool, skip_k8s_bootstrap: bool, skip_preflight: bool,
+) -> None:
+    """Enable DataEngine using auto-discovery of existing tenant state.
+
+    Loads a MINIMAL config (just vms + kubernetes + container_registry) and
+    discovers the rest from VMS — tenant, group, bucket-owner user, view
+    policy, and vip_pool are all queried by name/role/local_provider. This
+    avoids re-declaring everything `tenant create` already put on the cluster.
+
+    Calls the same `enable_dataengine` flow as `vastde-orch enable` — just
+    with the schema constructed in-memory from discovery.
+    """
+    cfg = load_tenant_enable_config(cfg_path)
+    vms = _vms_for_bootstrap(cfg, dry_run=plan)
+    sys.exit(run_tenant_enable(
+        cfg, vms,
+        skip_k8s_bootstrap=skip_k8s_bootstrap,
+        skip_preflight=skip_preflight,
+    ))
 
 
 # ── function subgroup ───────────────────────────────────────────────────────

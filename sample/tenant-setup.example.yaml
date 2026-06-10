@@ -1,10 +1,11 @@
-# Sample config for scripts/setup_tenant.py
+# Sample config for `vastde-orch tenant create|destroy`
 #
 # Usage:
 #   cp sample/tenant-setup.example.yaml tenant-setup.yaml
 #   # edit fields below
-#   python scripts/setup_tenant.py -c tenant-setup.yaml --plan   # dry-run
-#   python scripts/setup_tenant.py -c tenant-setup.yaml          # apply
+#   vastde-orch tenant create  -c tenant-setup.yaml --plan   # dry-run
+#   vastde-orch tenant create  -c tenant-setup.yaml          # apply
+#   vastde-orch tenant destroy -c tenant-setup.yaml --yes    # tear down
 #
 # Env vars referenced via ${VAR} syntax must be set in your shell or .env:
 #   VMS_USER                — cluster-admin username
