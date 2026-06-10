@@ -1,0 +1,89 @@
+# Sample config for `vastde-orch tenant enable`
+#
+# This is the auto-discovery enable flow — it queries VMS for tenant +
+# identity + view_policy + vip_pool + tenant_admin (all created by
+# `tenant create`) and only asks you for what VMS doesn't already know:
+# K8s + container registry. Result: ~17 lines required instead of ~60.
+#
+# Prerequisite: you've already run `vastde-orch tenant create` against
+# this tenant. If not, run that first (see sample/tenant-setup.example.yaml).
+#
+# Usage:
+#   cp sample/tenant-enable.example.yaml my-tenant-enable.yaml
+#   # fill in the K8s + registry fields below
+#   vastde-orch tenant enable -c my-tenant-enable.yaml --plan      # discover + dry-run
+#   vastde-orch tenant enable -c my-tenant-enable.yaml             # apply
+#
+# Env vars referenced via ${VAR} must be set in your shell or .env first:
+#   set -a; source .env; set +a
+#   VMS_USER                — cluster-admin for discovery + lookups
+#   VMS_PASSWORD            — cluster-admin password
+#   TENANT_ADMIN_PASSWORD   — read by setup-provisioning for the /dataengine/ enable call
+#
+# What auto-discovery resolves from VMS:
+#   tenant_id + local_provider_id  → from the tenant record by name
+#   group                          → the unique group on the tenant's local provider
+#   bucket_owner                   → the unique non-system user with allow_create_bucket=true
+#                                    (filters VAST system users dataengine/telemetries-collector-*)
+#   view_policy                    → the unique S3_NATIVE policy on the tenant
+#   vip_pool                       → the unique PROTOCOLS pool on the tenant
+#   tenant_admin                   → the TENANT_ADMIN manager on the tenant
+# If any is ambiguous (multiple matches), override below.
+
+# ─── REQUIRED ──────────────────────────────────────────────────────────────
+
+vms:
+  address:  var203.selab.vastdata.com
+  tenant:   my-tenant                                  # the tenant to enable DataEngine on
+  user:     ${VMS_USER}
+  password: ${VMS_PASSWORD}
+
+kubernetes:
+  name:             my-tenant-k8s                      # name to register the K8s cluster as on the tenant
+  api_server:       https://10.143.2.26:6443           # K8s API URL — reachable from VMS
+  kubeconfig:       ~/.kube/my-admin-cert.yaml         # used by the kubectl preflight check
+  ca_cert_path:     ~/.kube/my-admin-certs/ca.pem      # for VMS↔K8s mTLS — see kubernetes/user-setup/create-user-cert-remote.sh
+  client_cert_path: ~/.kube/my-admin-certs/client.pem
+  client_key_path:  ~/.kube/my-admin-certs/client.key
+
+container_registry:
+  name:     my-registry                                # name to register the registry as on the tenant
+  base_url: docker.io                                  # registry host (no scheme)
+  auth:
+    method: none                                       # `none` | `password` (with username_env + password_env) | `kubernetes_secret`
+
+# ─── OPTIONAL — auto-derived defaults below; only set if you need overrides ─
+
+# broker_view:
+#   path:   /my-tenant/de-broker                       # default = /<tenant>/de-broker
+#   bucket: my-de-broker                               # default = <tenant>-de-broker
+
+# topics:
+#   default:
+#     name:            my-default                      # default = <tenant>-default
+#     partitions:      16                              # default 16
+#     retention_hours: 24                              # default 24
+#   dead_letter:
+#     name:            my-dlq                          # default = <tenant>-dlq
+#     partitions:      4                               # default 4
+#     retention_hours: 24                              # default 24
+
+# tenant_admin:
+#   username:     my-tenant-admin                      # default = auto-discovered from VMS
+#   password_env: TENANT_ADMIN_PASSWORD                # default
+
+# ─── Disambiguation — set only if auto-discovery says it's ambiguous ───────
+# If you see a FATAL like "multiple PROTOCOLS vippools on tenant ...",
+# specify the correct name(s) here.
+
+# vip_pool_name:     my-vip-pool                       # only set if multiple PROTOCOLS vippools on the tenant
+# group_name:        my-de-users                       # only set if multiple groups on the tenant's local provider
+# bucket_owner_name: my-de-owner                       # only set if multiple non-system bucket-owner candidates
+
+# ─── Registry auth (only if container_registry.auth.method = password) ─────
+
+# container_registry:
+#   auth:
+#     method:       password
+#     username_env: REGISTRY_USER                      # env var holding the registry username
+#     password_env: REGISTRY_PASSWORD                  # env var holding the registry password
