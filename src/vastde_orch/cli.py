@@ -79,11 +79,25 @@ def _build_vms(cfg: VastdeConfig, dry_run: bool) -> VmsClient:
 
 def _build_vastde_cli(cfg: VastdeConfig, dry_run: bool) -> VastdeCli:
     builder_image = os.environ.get("VASTDE_BUILDER_IMAGE", "vastdataorg/vast-builder:latest")
+    # Prefer tenant_admin creds — VMS super-admin can't auth into the per-tenant
+    # /api/dataengine/ endpoints that vastde calls (returns 401). Fall back to
+    # vms.user only when no enablement.identity.tenant_admin is configured.
+    ta = (
+        cfg.enablement.identity.tenant_admin
+        if cfg.enablement and cfg.enablement.identity and cfg.enablement.identity.tenant_admin
+        else None
+    )
+    if ta:
+        username = ta.username
+        password = os.environ.get(ta.password_env, "")
+    else:
+        username = cfg.vms.user or ""
+        password = cfg.vms.password or cfg.vms.token or ""
     ctx = VastdeContext(
         vms_url=f"https://{cfg.vms.address}",
         tenant=cfg.vms.tenant,
-        username=cfg.vms.user or "",
-        password=cfg.vms.password or cfg.vms.token or "",
+        username=username,
+        password=password,
         builder_image_url=builder_image,
     )
     return VastdeCli(ctx, dry_run=dry_run)

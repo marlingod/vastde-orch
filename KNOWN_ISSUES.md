@@ -189,3 +189,57 @@ These are not schema gaps but operator-experience gaps; capturing them so they d
 - **`vastde compute-clusters link` requires cluster-admin VMS creds, not tenant-admin.** Despite `identity.tenant_admin` being designed for tenant-scoped operations, the cluster link step calls a VMS endpoint that returns `400 Failed to provision telemetries resources` with tenant-admin creds. Cluster-admin + `--tenant <name>` works. This isn't currently captured anywhere — neither in `docs/vms-endpoints-reference.md` nor in code comments. Worth documenting and possibly auto-detecting in a future shell-out path.
 
 - **HPA min=5 for `vast-telemetries-collector` blocks small-cluster deploys.** A 2-node lab cluster (1 master, 1 worker, 4 CPU each) cannot fit 5 collectors at 500m CPU without untainting the master. The Helm chart deploys and pods schedule fine, but `zarf package deploy` Helm-fails with `context deadline exceeded` because the HPA can never reach min replicas. Either: (a) make HPA min configurable via a zarf `--set` value, or (b) document the minimum cluster size, or (c) preflight-check schedulable CPU.
+
+---
+
+## TODO: `pipelines/` module speaks a vastde CLI surface that does not exist
+
+**Discovered on:** 2026-06-11 during the first end-to-end `vastde-orch apply` against wi-tenant on var203. `--plan` had always worked because the dry-run branch shorts out before any CLI call; the real apply is the first time we exercise the `vastde` shell-outs in `pipelines/`.
+
+### What we found
+
+Both vastde versions on hand (Mac `v5.4.1-dev.c0b8b3d5`, .74 `v5.5.0-dev.20440e54`) reject the orchestrator's invocation on three independent grounds:
+
+| Layer | What the orchestrator emits | What the CLI actually wants |
+|---|---|---|
+| Flag for body | `--file-input -` (stdin) | `-f, --from-file <path>` (file path) |
+| Body schema | JSON with `source_view`, `event_type`, `object_key_filters: {prefix,suffix}` | Individual flags (`--source-bucket`, `--name-prefix`, `--name-suffix`, `--tag-prefix`, `--tag-suffix`) plus `--broker-type` + `--broker-name` |
+| Event name | `ElementCreated` | `ObjectCreated:*` (similarly `ObjectRemoved:*`, `ObjectTagging:Put`, `ObjectTagging:Delete`) |
+
+So *all* of `triggers_create/triggers_update`, `functions_create/functions_new_revision`, and `pipelines_create/pipelines_update` in `src/vastde_orch/clients/vastde_cli.py` are broken against either vastde version. The dry-run scoreboard hides this — `--plan` returns `would_create` without invoking the CLI.
+
+### Symptom we hit
+
+```
+$ vastde-orch apply -c sample/testing/wi-fraud-pipeline.yaml
+=== pipeline: wi-fraud-scorer ===
+ShellError: expected JSON on stdout but got: Expecting value: line 1 column 1 (char 0)
+# real stderr (lost by run_json's wrap): "unknown flag: --file-input"
+```
+
+`run_json` in `clients/_shell.py:70` swallows stderr when stdout fails to parse — the actual `unknown flag: --file-input` message never reaches the caller. Worth fixing as part of the rewrite.
+
+### Wi-tenant state after the failed apply
+
+Verified post-failure: triggers list shows only the pre-existing `first-trigger`; functions and pipelines are empty. The CLI rejected the call before any mutation, so wi-tenant is clean.
+
+### Proposed fix
+
+1. **Translate to current vastde flag surface.** Replace `--file-input -` with one of:
+   - `-f <tempfile>` writing the body as YAML (matching the CLI's parser), or
+   - individual flags assembled per resource type (cleaner — sidesteps schema drift in the YAML format).
+2. **Map body fields.** `source_view` (path) → resolve to `source_bucket` (name) via VMS view lookup; `object_key_filters.{prefix,suffix}` → `--name-prefix` / `--name-suffix`; `event_type: ElementCreated` → `--events ObjectCreated:*`.
+3. **Resolve `--broker-type` + `--broker-name`** from the enablement event_broker block (Internal + bucket name for VAST broker, External + URL for Kafka).
+4. **Same translation for `functions create` and `pipelines create`** — verify the live flag surface before coding (`vastde functions create --help`, `vastde pipelines create --help`).
+5. **Stop dropping stderr.** Update `run_json` to include `result.stderr` in the `ShellError` when stdout doesn't parse — the lost `unknown flag` message cost ~30 min of guessing here.
+6. **Add a real-CLI integration test** (gated by `VASTDE_BIN` env var). The dry-run unit tests are not enough because they shortcut the CLI invocation.
+
+### Why not fix on master immediately
+
+This work is being done on `experiment/pipeline-build` per the user's explicit Stage A / Stage B separation (master = stable Stage A enablement; experiment branch = pipelines work). Land the fix on the experiment branch, validate end-to-end on wi-tenant, then PR into master.
+
+### Status
+
+- Stage B Phase 3 wi-tenant deploy **paused** as of 2026-06-11.
+- Image `docker.selab.vastdata.com/vast-functions/fraud-scorer:11252e4ae821` is already built + pushed (sha256:61fe0db1…) — usable once the orchestrator rewrite lands.
+- `sample/testing/wi-fraud-pipeline.yaml` already on `experiment/pipeline-build`; ready to re-run once the orchestrator speaks the right CLI surface.
