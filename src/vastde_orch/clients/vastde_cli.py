@@ -43,7 +43,18 @@ class VastdeCli:
     # ── one-shot config bootstrap ───────────────────────────────────────
 
     def configure(self) -> None:
-        """Run `vastde config init` once per process."""
+        """Run `vastde config init` once per process.
+
+        Passes `--force` so it overwrites any existing ~/.vast/config.toml
+        (without it, vastde silently no-ops with the message "Config file
+        found at ... use --force to overwrite" — and every subsequent
+        command runs against whatever stale tenant context was in the file,
+        producing confusing 401s). Verified live on .74 2026-06-11.
+
+        Callers that want to preserve the operator's prior config.toml
+        across the run should back it up + restore via try/finally before
+        and after invoking us (see cli.py:tenant_register_de_resources).
+        """
         if self._configured:
             return
         run(
@@ -54,6 +65,7 @@ class VastdeCli:
                 "--username", self._ctx.username,
                 "--builder-image-url", self._ctx.builder_image_url,
                 "--vms-url", self._ctx.vms_url,
+                "--force",
             ],
         )
         self._configured = True
