@@ -104,6 +104,44 @@ set -a; source .env; set +a
 
 ---
 
+## Need a Kubernetes cluster?
+
+`vastde-orch tenant create` only touches the VAST cluster — it works with no
+K8s at all. But `vastde-orch tenant enable` registers a K8s cluster with VMS
+and expects one to be reachable. If you don't already have one provisioned
+with VAST DataEngine prerequisites (zarf + Knative + KEDA + VAST operator +
+CSI), use the companion bootstrap repo:
+
+**→ https://github.com/marlingod/vast-k8s-bootstrap**
+
+That repo is an ansible toolchain that takes you from "fresh Ubuntu masters
++ workers" to "K8s cluster ready for DataEngine," including:
+
+- kubeadm install + node join
+- Inotify limits tuning (VAST DataEngine min: 8192 instances, 524288 watches)
+- Zarf install + dataengine package deploy
+- Knative operator CRDs (with the Helm adoption labels — see
+  `feedback_helm_zarf_orphan_pattern.md` in our memory)
+- VAST CSI driver install
+- Cluster-admin user + mTLS cert issuance (the certs `tenant enable`
+  references via `kubernetes.{ca,client_cert,client_key}_path`)
+
+Output of that repo:
+- A reachable K8s `api_server` URL (you'll plug it into `kubernetes.api_server`
+  in `sample/tenant-enable.example.yaml`)
+- A kubeconfig + 3 PEM files at predictable paths (you'll plug them into the
+  same YAML under `kubernetes.{kubeconfig, ca_cert_path, client_cert_path,
+  client_key_path}`)
+
+Once that's done, come back here and run `vastde-orch tenant create` then
+`vastde-orch tenant enable` per the quick starts below.
+
+> If you already have a K8s cluster from another tool (Rancher, kops, eks,
+> hand-rolled), make sure it has the DataEngine prerequisites listed above —
+> otherwise `tenant enable` will work but the function pods won't start.
+
+---
+
 ## Pick your path
 
 | You want to… | Use |
@@ -205,6 +243,10 @@ After `tenant create`, almost every field needed by the original full-schema
 `enable` flow already exists on VMS. `vastde-orch tenant enable` reads them
 back from VMS at run time and constructs the full `EnablementSpec` in memory.
 You only declare the things VMS **doesn't** know yet: K8s + container registry.
+
+> Don't have a K8s cluster ready? See [Need a Kubernetes cluster?](#need-a-kubernetes-cluster)
+> above — the [`vast-k8s-bootstrap`](https://github.com/marlingod/vast-k8s-bootstrap)
+> repo provisions one and emits the cert paths you'll need here.
 
 The YAML is ~13 lines instead of 60:
 
