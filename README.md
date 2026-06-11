@@ -102,6 +102,13 @@ set -a; source .env; set +a
 
 > All `vastde-orch tenant ...` commands below assume you've done this once.
 
+> **No Kubernetes cluster yet?** `vastde-orch tenant create` works without one,
+> but `vastde-orch tenant enable` needs a reachable cluster with DataEngine
+> prerequisites. Provision one via
+> [`vast-k8s-bootstrap`](https://github.com/marlingod/vast-k8s-bootstrap) first
+> — see the [Need a Kubernetes cluster?](#need-a-kubernetes-cluster) section
+> below for details.
+
 ---
 
 ## Need a Kubernetes cluster?
