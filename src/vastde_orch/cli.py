@@ -425,28 +425,23 @@ def tenant_enable_cmd(
 @click.option("--plan", is_flag=True,
               help="Dry-run via `vastde --dry-run` (no resources actually linked).")
 def tenant_register_de_resources(cfg_path: Path, plan: bool) -> None:
-    """Register K8s cluster + container registry on the tenant via VMS DE-API REST.
+    """Link the K8s cluster + container registry to DataEngine via the `vastde` CLI.
 
-    POSTs directly to:
-      /api/dataengine/mtls-authentication-credentials/   (3 PEMs, base64'd)
-      /api/dataengine/kubernetes-clusters/               (uses the mtls guid)
-      /api/dataengine/container-registries/              (uses the cluster VRN)
-
-    Bypasses both vastpy's `/api/latest/` routing (which 404s on these
-    endpoints — `tenant enable` correctly skips them with that diagnosis) AND
-    the `vastde` CLI's `serverless/kubernetes-clusters/` path (which 422s on
-    some VMS versions with "Extra inputs are not permitted"). Sends only the
-    documented minimal payload per docs/vms-api-full-catalog.md A.3-A.5.
-
-    All 3 calls are idempotent: look up by name first, return the existing
-    guid/vrn if already registered.
+    Some VMS versions don't expose `POST /api/dataengine/kubernetes-clusters/`
+    or `POST /api/dataengine/container-registries/` over REST — they 404. Our
+    `tenant enable` flow correctly catches that and records a `skipped` outcome
+    pointing at "finish via DataEngine Web UI or vastde CLI." THIS subcommand
+    IS the "finish via vastde CLI" path: it shells out to
+    `vastde compute-clusters link` and `vastde container-registries link` to
+    register both resources on the target tenant.
 
     Reuses the same minimal YAML schema as `tenant enable`
     (sample/tenant-enable.example.yaml).
 
-    Runs from anywhere — no `vastde` CLI dependency. Tenant-admin password
-    must be in $TENANT_ADMIN_PASSWORD (or whatever tenant_admin.password_env
-    points at in the YAML).
+    PREREQUISITES: must run from a host where `vastde` is on PATH (typically
+    the build host, not Mac). On the operator host where this lives, the
+    target tenant's admin credentials must be set in env as $TENANT_ADMIN_PASSWORD
+    (or whatever tenant_admin.password_env is set to in the YAML).
     """
     cfg = load_tenant_enable_config(cfg_path)
     tenant_name = cfg["vms"]["tenant"]
@@ -458,51 +453,65 @@ def tenant_register_de_resources(cfg_path: Path, plan: bool) -> None:
         click.echo(f"FATAL: env var {ta_pwd_env!r} not set (tenant-admin password)", err=True)
         sys.exit(2)
 
-    vms = _vms_for_bootstrap(cfg, dry_run=plan)
-
-    # 1. mTLS credential (3 PEMs base64'd)
-    k8s = cfg["kubernetes"]
-    mtls_name = f"{k8s['name']}-credentials"
-    namespaces = k8s.get("namespaces") or ["vast-dataengine"]
-    click.echo(f"\n── 1. mTLS credential {mtls_name!r} ──")
-    mtls_guid = vms.register_de_mtls_credential(
-        mtls_name,
-        ca_path=Path(k8s["ca_cert_path"]).expanduser(),
-        client_cert_path=Path(k8s["client_cert_path"]).expanduser(),
-        client_key_path=Path(k8s["client_key_path"]).expanduser(),
-        tenant_admin_user=ta_user, tenant_admin_password=ta_pwd,
+    vctx = VastdeContext(
+        vms_url=f"https://{cfg['vms']['address']}",
+        tenant=tenant_name,
+        username=ta_user,
+        password=ta_pwd,
+        builder_image_url=os.environ.get(
+            "VASTDE_BUILDER_IMAGE_URL",
+            "vastdataorg/vast-builder:latest",
+        ),
     )
-    click.echo(f"  mtls_credentials_guid: {mtls_guid}")
 
-    # 2. K8s cluster
-    click.echo(f"\n── 2. K8s cluster {k8s['name']!r} "
-               f"(api_server={k8s['api_server']}, namespaces={namespaces}) ──")
-    cluster_vrn = vms.register_de_k8s_cluster(
-        k8s["name"],
-        kube_api_url=k8s["api_server"],
-        mtls_credentials_guid=mtls_guid,
-        namespaces=namespaces,
-        tenant_admin_user=ta_user, tenant_admin_password=ta_pwd,
-    )
-    click.echo(f"  vrn: {cluster_vrn}")
+    # Backup vastde's existing ~/.vast/config.toml (preserve other-tenant work)
+    config_path = Path.home() / ".vast" / "config.toml"
+    backup = config_path.read_bytes() if config_path.exists() else None
 
-    # 3. Container registry (references the cluster above by VRN)
-    reg = cfg["container_registry"]
-    auth = reg.get("auth") or {"method": "none"}
-    click.echo(f"\n── 3. Container registry {reg['name']!r} "
-               f"(url={reg['base_url']}, auth={auth['method']}) ──")
-    registry_guid = vms.register_de_container_registry(
-        reg["name"],
-        url=reg["base_url"],
-        primary_cluster_vrn=cluster_vrn,
-        primary_namespace=namespaces[0],
-        auth_type=auth["method"],
-        username=os.environ.get(auth.get("username_env", "")) if auth["method"] == "password" else None,
-        password=os.environ.get(auth.get("password_env", "")) if auth["method"] == "password" else None,
-        secret=auth.get("kubernetes_secret_name") if auth["method"] == "secret" else None,
-        tenant_admin_user=ta_user, tenant_admin_password=ta_pwd,
-    )
-    click.echo(f"  guid: {registry_guid}")
+    try:
+        cli = VastdeCli(vctx, dry_run=plan)
+        cli.configure()  # writes new config.toml pointing at target tenant
+
+        k8s = cfg["kubernetes"]
+        click.echo(f"\n── Linking compute cluster {k8s['name']!r} "
+                   f"(api_server={k8s['api_server']}) ──")
+        result = cli.compute_clusters_link(
+            k8s["name"],
+            kube_api_url=k8s["api_server"],
+            namespaces=k8s.get("namespaces") or ["vast-dataengine"],
+            ca_path=Path(k8s["ca_cert_path"]).expanduser(),
+            client_cert_path=Path(k8s["client_cert_path"]).expanduser(),
+            client_key_path=Path(k8s["client_key_path"]).expanduser(),
+            mtls_credentials_name=f"{k8s['name']}-credentials",
+        )
+        click.echo(result.stdout)
+        if result.stderr:
+            click.echo(result.stderr, err=True)
+
+        reg = cfg["container_registry"]
+        auth = reg.get("auth") or {"method": "none"}
+        click.echo(f"\n── Linking container registry {reg['name']!r} "
+                   f"(url={reg['base_url']}, auth={auth['method']}) ──")
+        result = cli.container_registries_link(
+            reg["name"],
+            url=reg["base_url"],
+            auth_type=auth["method"],
+            primary_cluster=k8s["name"],
+            primary_namespace=(k8s.get("namespaces") or ["vast-dataengine"])[0],
+            username=os.environ.get(auth.get("username_env", "")) if auth["method"] == "password" else None,
+            password=os.environ.get(auth.get("password_env", "")) if auth["method"] == "password" else None,
+            secret=auth.get("kubernetes_secret_name") if auth["method"] == "secret" else None,
+        )
+        click.echo(result.stdout)
+        if result.stderr:
+            click.echo(result.stderr, err=True)
+    finally:
+        if backup is not None:
+            config_path.write_bytes(backup)
+            click.echo(f"\nRestored {config_path} to its previous state.")
+        else:
+            config_path.unlink(missing_ok=True)
+            click.echo(f"\nRemoved {config_path} (no previous config existed).")
 
 
 # ── function subgroup ───────────────────────────────────────────────────────
