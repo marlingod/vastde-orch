@@ -186,3 +186,93 @@ class VastdeCli:
         if self._dry_run:
             return
         run([VASTDE_BIN, "pipelines", "delete", name, "--yes"])
+
+    # ── compute clusters (K8s) — REST-blind on some VMS versions ────────
+    # `POST /api/dataengine/kubernetes-clusters/` returns 404 on this VMS
+    # version (verified live var203 2026-06-07). The `vastde` CLI's
+    # `compute-clusters link` command is the official fallback per the
+    # `tenant enable` skip message we emit. Mirrors the help output of
+    # `vastde compute-clusters link --help`.
+
+    def compute_clusters_link(
+        self, name: str, *,
+        kube_api_url: str,
+        namespaces: list[str],
+        ca_path: Path,
+        client_cert_path: Path,
+        client_key_path: Path,
+        mtls_credentials_name: str | None = None,
+        description: str | None = None,
+    ) -> ShellResult:
+        """Link a Kubernetes cluster as a DataEngine compute cluster.
+
+        Wraps `vastde compute-clusters link`. The CLI creates an mTLS
+        credentials resource from the three PEM files on-the-fly (no
+        separate mtls-credentials POST needed).
+        """
+        self.configure()
+        args = [
+            VASTDE_BIN, "compute-clusters", "link",
+            "--name", name,
+            "--kube-api-url", kube_api_url,
+            "--namespaces", ",".join(namespaces),
+            "--ca-path", str(ca_path),
+            "--client-cert-path", str(client_cert_path),
+            "--client-key-path", str(client_key_path),
+        ]
+        if mtls_credentials_name:
+            args += ["--mtls-credentials-name", mtls_credentials_name]
+        if description:
+            args += ["--description", description]
+        if self._dry_run:
+            args += ["--dry-run"]
+        return run(args)
+
+    # ── container registries — also REST-blind ───────────────────────────
+
+    def container_registries_link(
+        self, name: str, *,
+        url: str,
+        auth_type: str,
+        primary_cluster: str,
+        primary_namespace: str = "vast-dataengine",
+        username: str | None = None,
+        password: str | None = None,
+        email: str | None = None,
+        secret: str | None = None,
+        description: str | None = None,
+    ) -> ShellResult:
+        """Link a container registry to DataEngine.
+
+        Wraps `vastde container-registries link`. Requires `--primary-cluster`
+        — the compute cluster must be linked first (`compute_clusters_link`).
+        `auth_type` is `none` | `password` | `secret`.
+        """
+        self.configure()
+        args = [
+            VASTDE_BIN, "container-registries", "link",
+            "--name", name,
+            "--url", url,
+            "--auth-type", auth_type,
+            "--primary-cluster", primary_cluster,
+            "--primary-namespace", primary_namespace,
+        ]
+        if auth_type == "password":
+            if not (username and password):
+                raise ValueError(
+                    "container_registries_link: auth_type=password requires username + password"
+                )
+            args += ["--username", username, "--password", password]
+            if email:
+                args += ["--email", email]
+        elif auth_type == "secret":
+            if not secret:
+                raise ValueError(
+                    "container_registries_link: auth_type=secret requires --secret"
+                )
+            args += ["--secret", secret]
+        if description:
+            args += ["--description", description]
+        if self._dry_run:
+            args += ["--dry-run"]
+        return run(args)
