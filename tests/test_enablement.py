@@ -238,8 +238,6 @@ class TestEnableOrchestration:
         vms.ensure_viewpolicy.return_value = _outcome("dataengine-default")
         vms.ensure_view.return_value = _outcome("/sys/de")
         vms.ensure_topic.return_value = _outcome("topic")
-        vms.ensure_container_registry.return_value = _outcome("primary")
-        vms.ensure_k8scluster.return_value = _outcome("k8s")
         vms.ensure.return_value = _outcome("generic")
         # Lookups for IDs
         vms.get_or_raise.side_effect = lambda resource, **kw: {"id": 42, "name": kw.get("key_value")}
@@ -254,8 +252,10 @@ class TestEnableOrchestration:
 
         # Tenant came first
         assert vms.ensure_tenant.called
-        # k8s cluster registration
-        assert vms.ensure_k8scluster.called
+        # K8s cluster + container registry now go through the DE-API
+        # (vms.register_de_*); they're skipped here because the test fixture
+        # has no tenant_admin (required for the JWT auth those endpoints use).
+        # See test_register_de_compute_resources_* for that path.
         # Identity (group → user)
         assert vms.ensure_group.called
         assert vms.ensure_user.called
@@ -269,8 +269,6 @@ class TestEnableOrchestration:
         assert sorted(view_call.kwargs["protocols"]) == ["DATABASE", "KAFKA", "S3"]
         # Two topics: default + dlq
         assert vms.ensure_topic.call_count == 2
-        # Container registry
-        assert vms.ensure_container_registry.called
         # Tenant DataEngine toggle (via generic ensure)
         assert vms.ensure.call_count >= 1  # at least the tenantdataengine toggle
         assert isinstance(plan.outcomes, list)
@@ -281,8 +279,6 @@ class TestEnableOrchestration:
         vms.ensure_tenant.return_value = _outcome()
         vms.ensure_group.return_value = _outcome()
         vms.ensure_user.return_value = _outcome()
-        vms.ensure_k8scluster.return_value = _outcome()
-        vms.ensure_container_registry.return_value = _outcome()
         vms.ensure.return_value = _outcome()
         vms.get_or_raise.side_effect = lambda resource, **kw: {"id": 1, "name": kw["key_value"]}
 

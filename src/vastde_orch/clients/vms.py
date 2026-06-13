@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from vastpy import VASTClient
@@ -119,6 +120,7 @@ class VmsClient:
     def __init__(self, spec: VmsSpec, *, dry_run: bool = False) -> None:
         self._dry_run = dry_run
         self._tenant_name = spec.tenant  # The TARGET tenant — used by callers, not as a request header.
+        self._address = spec.address  # used by the DE-API helpers
         # Important: do NOT pass `tenant=` to vastpy here. The vms-level
         # credentials are typically a cluster-admin; sending X-Tenant-Name with
         # those creds causes VMS to reject the request as "invalid user/password".
@@ -638,3 +640,209 @@ class VmsClient:
                 "without it). Pass tenant_id=<int>."
             )
         return self._raw.users[user_id].access_keys.post(tenant_id=tenant_id)
+
+    # ── DataEngine direct REST (catalog A.3 / A.4 / A.5) ─────────────────
+    # K8s clusters, container registries, and mTLS credentials live on the
+    # DataEngine API (/api/dataengine/*), NOT the VMS swagger surface that
+    # vastpy talks to. These helpers POST directly with `requests`, using a
+    # tenant-admin JWT (the only auth the DE endpoints accept — Basic gets
+    # "Failed to parse VMS auth jwt!"). Returns (value, was_created) so the
+    # caller can record CREATED vs UNCHANGED in its plan.
+
+    def _fetch_tenant_jwt(self, tenant_admin_user: str, tenant_admin_password: str) -> str:
+        """POST /api/latest/token/<tenant>/ → access JWT for tenant-scoped calls.
+
+        Cached on the VmsClient instance for the (tenant, username) pair —
+        valid for ~1h per VMS default.
+        """
+        cache = getattr(self, "_jwt_cache", None)
+        if cache is None:
+            self._jwt_cache: dict[tuple[str, str], str] = {}
+            cache = self._jwt_cache
+        key = (self._tenant_name, tenant_admin_user)
+        if key in cache:
+            return cache[key]
+        import json
+        import urllib3
+        urllib3.disable_warnings()
+        http = urllib3.PoolManager(cert_reqs="CERT_NONE")
+        r = http.request(
+            "POST",
+            f"https://{self._address}/api/latest/token/{self._tenant_name}",
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {"username": tenant_admin_user, "password": tenant_admin_password}
+            ).encode(),
+        )
+        if r.status != 200:
+            raise RuntimeError(
+                f"JWT fetch for tenant {self._tenant_name!r} failed "
+                f"(HTTP {r.status}): {r.data.decode()[:200]}"
+            )
+        jwt = json.loads(r.data)["access"]
+        cache[key] = jwt
+        return jwt
+
+    def _de_api_request(
+        self, method: str, path: str, *,
+        tenant_admin_user: str, tenant_admin_password: str,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """{method} /api/dataengine/{path} with Bearer JWT auth.
+
+        DE endpoints reject HTTP Basic with a JWT-decode error
+        (`Failed to parse VMS auth jwt!`) — they require the tenant-scoped
+        access token from /api/latest/token/{tenant}/.
+        """
+        import requests
+        import urllib3
+        urllib3.disable_warnings()  # lab self-signed cert
+        jwt = self._fetch_tenant_jwt(tenant_admin_user, tenant_admin_password)
+        url = f"https://{self._address}/api/dataengine/{path}"
+        resp = requests.request(
+            method, url, json=body,
+            headers={"Authorization": f"Bearer {jwt}"},
+            verify=False, timeout=60,
+        )
+        if not resp.ok:
+            raise RuntimeError(
+                f"{method} /api/dataengine/{path} failed: "
+                f"{resp.status_code} {resp.text[:400]}"
+            )
+        return resp.json() if resp.text else {}
+
+    def _de_api_list(
+        self, path: str, *, tenant_admin_user: str, tenant_admin_password: str,
+    ) -> list[dict[str, Any]]:
+        resp = self._de_api_request(
+            "GET", path,
+            tenant_admin_user=tenant_admin_user,
+            tenant_admin_password=tenant_admin_password,
+        )
+        # DE-API list responses use `data` (not `results`) with a sibling
+        # `pagination` object.
+        if isinstance(resp, dict):
+            return resp.get("data") or resp.get("results") or []
+        return list(resp)
+
+    def register_de_mtls_credential(
+        self, name: str, *,
+        ca_path: Path, client_cert_path: Path, client_key_path: Path,
+        tenant_admin_user: str, tenant_admin_password: str,
+    ) -> tuple[str, bool]:
+        """Returns (guid, was_created). Idempotent by name."""
+        existing = self._de_api_list(
+            "mtls-authentication-credentials/",
+            tenant_admin_user=tenant_admin_user,
+            tenant_admin_password=tenant_admin_password,
+        )
+        for cred in existing:
+            if cred.get("name") == name:
+                return cred["guid"], False
+        if self._dry_run:
+            return "<dry-run-mtls-guid>", True
+        import base64
+        body = {
+            "name": name,
+            "certificate_authority_b64": base64.b64encode(Path(ca_path).read_bytes()).decode(),
+            "client_certificate_b64": base64.b64encode(Path(client_cert_path).read_bytes()).decode(),
+            "client_key_b64": base64.b64encode(Path(client_key_path).read_bytes()).decode(),
+        }
+        created = self._de_api_request(
+            "POST", "mtls-authentication-credentials/",
+            tenant_admin_user=tenant_admin_user,
+            tenant_admin_password=tenant_admin_password,
+            body=body,
+        )
+        return created["guid"], True
+
+    def register_de_k8s_cluster(
+        self, name: str, *,
+        kube_api_url: str,
+        mtls_credentials_guid: str,
+        namespaces: list[str],
+        tenant_admin_user: str, tenant_admin_password: str,
+    ) -> tuple[str, bool]:
+        """Returns (vrn, was_created). Idempotent by name.
+
+        Side-effect: synchronously creates a `VastTenant` CR on the K8s
+        cluster — if one already exists in any state (incl. `Deleting` with
+        the 300s operator delay), the POST 400s with "Failed to provision
+        telemetries resources".
+        """
+        existing = self._de_api_list(
+            "kubernetes-clusters/",
+            tenant_admin_user=tenant_admin_user,
+            tenant_admin_password=tenant_admin_password,
+        )
+        for c in existing:
+            if c.get("name") == name:
+                vrn = c.get("vrn") or f"vast:dataengine:kubernetes-clusters:{name}"
+                return vrn, False
+        if self._dry_run:
+            return f"<dry-run-cluster-vrn:{name}>", True
+        body = {
+            "name": name,
+            "kube_api_url": kube_api_url,
+            "mtls_credentials_guid": mtls_credentials_guid,
+            "namespaces": namespaces,
+        }
+        created = self._de_api_request(
+            "POST", "kubernetes-clusters/",
+            tenant_admin_user=tenant_admin_user,
+            tenant_admin_password=tenant_admin_password,
+            body=body,
+        )
+        vrn = created.get("vrn") or f"vast:dataengine:kubernetes-clusters:{name}"
+        return vrn, True
+
+    def register_de_container_registry(
+        self, name: str, *,
+        url: str,
+        primary_cluster_vrn: str,
+        primary_namespace: str,
+        auth_type: str,
+        tenant_admin_user: str, tenant_admin_password: str,
+        username: str | None = None,
+        password: str | None = None,
+        email: str | None = None,
+        secret: str | None = None,
+    ) -> tuple[str, bool]:
+        """Returns (guid, was_created). Idempotent by name. Uses the cluster
+        VRN to reference its primary K8s cluster (not GUID).
+        """
+        existing = self._de_api_list(
+            "container-registries/",
+            tenant_admin_user=tenant_admin_user,
+            tenant_admin_password=tenant_admin_password,
+        )
+        for r in existing:
+            if r.get("name") == name:
+                return r.get("guid", ""), False
+        if self._dry_run:
+            return f"<dry-run-registry-guid:{name}>", True
+        body: dict[str, Any] = {
+            "name": name,
+            "url": url,
+            "primary_kubernetes_cluster": {
+                "kubernetes_cluster_vrn": primary_cluster_vrn,
+                "namespace": primary_namespace,
+            },
+        }
+        if auth_type and auth_type != "none":
+            body["auth_type"] = auth_type
+            if username:
+                body["username"] = username
+            if password:
+                body["password"] = password
+            if email:
+                body["email"] = email
+            if secret:
+                body["secret"] = secret
+        created = self._de_api_request(
+            "POST", "container-registries/",
+            tenant_admin_user=tenant_admin_user,
+            tenant_admin_password=tenant_admin_password,
+            body=body,
+        )
+        return created.get("guid", ""), True
