@@ -1,0 +1,142 @@
+# Stage B Phase 3 deploy yaml — fraud-scorer pipeline on wi-tenant (var203).
+#
+# Same shape as usc-fraud-pipeline.yaml; values come from the live wi-tenant
+# discovery on 2026-06-11. The enablement block re-declares resources that
+# `tenant enable` already wired (idempotent — `apply` reports `unchanged`).
+#
+# Wi-tenant is on the OLDER identity model (default local provider, id=1),
+# so `tenant enable` discovery doesn't run cleanly here; instead we register
+# the DataEngine resources directly via DE-API (see
+# `vastde-orch tenant register-de-resources` on this branch).
+#
+# Run (from .74 so it shells out to `vastde` locally on linux/amd64):
+#   vastde-orch validate -c sample/testing/wi-fraud-pipeline.yaml
+#   vastde-orch apply    -c sample/testing/wi-fraud-pipeline.yaml --plan
+#   vastde-orch apply    -c sample/testing/wi-fraud-pipeline.yaml
+#
+# Live wi-tenant state (verified 2026-06-11):
+#   - DataEngine enabled                                       ✅
+#   - K8s cluster `kb-master` @ https://172.200.14.200:6443     ✅ already registered
+#   - Container registry `selab-de` → docker.selab.vastdata.com ✅ registered today
+#       (guid b4bd182e-f0a6-4916-9ed6-dc9c0e77a964)
+#   - VIP pool `wi-vipool` @ 172.200.203.135-137               ✅
+#   - Source view `/wi-sources3` (bucket `wi-source`)          ✅ reusing for fraud-raw
+#   - data-engine-wi-tenant policy bound to wi-group (gid=1209) ✅
+#   - wi-admin TENANT_ADMIN                                    ✅
+
+vms:
+  address:  var203.selab.vastdata.com
+  tenant:   wi-tenant
+  user:     ${VMS_USER}
+  password: ${VMS_PASSWORD}
+
+# ─── Enablement (re-declared; all resources already exist on wi-tenant) ─────
+enablement:
+  tenant:
+    name: wi-tenant
+    create_if_missing: false
+
+  kubernetes:
+    # Already registered on wi-tenant via DE-API; apply just references it.
+    name:             kb-master
+    api_server:       https://172.200.14.200:6443
+    # PEMs unused at apply time (registration already done) but declared for schema completeness.
+    ca_cert_path:     /home/vastdata/.kube/ca-admin-certs/ca.pem
+    client_cert_path: /home/vastdata/.kube/ca-admin-certs/client.pem
+    client_key_path:  /home/vastdata/.kube/ca-admin-certs/client.key
+
+  container_registry:
+    # Registered 2026-06-11 via DE-API (guid b4bd182e-f0a6-4916-9ed6-dc9c0e77a964).
+    name:     selab-de
+    base_url: docker.selab.vastdata.com
+    auth:
+      method: none                       # var203 lab registry — anonymous push (verified Phase 2)
+
+  event_broker:
+    kind:         vast
+    view_path:    /wi-tenant/de-broker
+    bucket_name:  wi-tenant-de-broker
+    bucket_owner: wi-de-user
+    view_policy:  data-engine-wi-tenant  # existing S3_NATIVE policy bound to wi-group
+    vip_pool:
+      name: wi-vipool
+      cidr: '24'
+      ip_range:
+        - 172.200.203.135
+        - 172.200.203.137
+    default_topic:
+      name: wi-tenant-default
+      partitions: 16
+      retention_hours: 24
+    deadletter_topic:
+      name: wi-tenant-dlq
+      partitions: 4
+      retention_hours: 24
+
+  identity:
+    group:
+      name: wi-group
+      gid:  1209
+      provider: vast
+    users:
+      - name: wi-de-user
+        uid:  1209
+    policy: assign_predefined
+    tenant_admin:
+      username:     wi-admin
+      password_env: TENANT_ADMIN_PASSWORD
+
+  # Reusing the existing `/wi-sources3` view as the fraud-raw source —
+  # no fraud-dedicated view needed for the demo (avoids creating one under
+  # wi-tenant's older identity model).
+  source_views:
+    - path:   /wi-sources3
+      bucket: wi-source
+      owner:  wi-de-user
+      policy: data-engine-wi-tenant
+
+# ─── Stage B: the actual pipeline ──────────────────────────────────────────
+pipelines:
+  - name:        wi-fraud-scorer
+    description: Real-time fraud detection — fraud-scorer pipeline ported to wi-tenant.
+    namespace:   vast-dataengine
+    k8s_cluster: kb-master
+
+    # Pipeline-level env — propagated to the function pod
+    env:
+      # Output topic broker. wi-vipool announces .135-.137; .137 is the
+      # canonical broker VIP (verified via discovery 2026-06-11).
+      KAFKA_BOOTSTRAP_SERVERS: "172.200.203.137:9092"
+
+    triggers:
+      - name:         wi-fraud-raw-trigger
+        type:         element
+        source_view:  /wi-sources3                  # existing view; reused for fraud demo
+        event_type:   ElementCreated
+        topic:        wi-fraud-transactions-raw     # internal topic the trigger publishes to
+        description:  Fires on every new transaction blob landed in /wi-sources3.
+
+    functions:
+      - name:        fraud-scorer
+        source:      ./functions/fraud-scorer
+        image:       docker.selab.vastdata.com/vast-functions/fraud-scorer
+        # `tag` omitted → auto-computed from content hash by `vastde-orch function tag`
+        description: Scores transactions across 5 weighted rules, publishes to scored + alerts topics.
+        deployment:
+          log_level:           INFO
+          timeout_seconds:     60
+          method_of_delivery:  unordered   # was `events_order: unordered` on the kafka manifest link
+          retries:             3
+          concurrency:
+            min: 1
+            max: 10
+          cpu:
+            min: 0.1                       # was 100m on the kafka manifest
+            max: 0.5                       # was 500m
+          memory:
+            min: "128Mi"
+            max: "256Mi"
+
+    flow:
+      - from: wi-fraud-raw-trigger
+        to:   fraud-scorer

@@ -1,0 +1,143 @@
+# Stage B Phase 3 deploy yaml — fraud-scorer pipeline on usc-tenant.
+#
+# This is the FULL vastde-orch schema (the one `vastde-orch apply` requires) —
+# enablement + pipelines. The enablement block re-declares what `tenant create`
+# and `tenant enable` already put on usc-tenant; it's idempotent (will report
+# `unchanged` on apply) but `apply` doesn't actually re-provision it, just
+# uses it as the wiring map for the pipeline.
+#
+# Run:
+#   vastde-orch validate -c sample/testing/usc-fraud-pipeline.yaml
+#   vastde-orch apply    -c sample/testing/usc-fraud-pipeline.yaml --plan
+#   vastde-orch apply    -c sample/testing/usc-fraud-pipeline.yaml
+#
+# Prerequisites — without these `apply` will fail at trigger/function deploy:
+#   - DataEngine enabled on usc-tenant       (✅ done — `tenant enable`)
+#   - K8s cluster registered as `usc-tenant-k8s` on usc-tenant   (❌ open: experiment/pipeline-build)
+#   - Container registry registered as `usc-registry` on usc-tenant   (❌ same)
+#   - Source view `/usc-tenant/fraud-raw` exists on usc-tenant    (❌ not yet created)
+#   - Fraud-scorer image pushed to `docker.selab.vastdata.com/vast-functions/fraud-scorer:dev`   (❌ build pending)
+#
+# Pipeline shape mirrors `vast/kafka/demo-dataengine/manifests/pipeline-manifest.yaml`
+# but translated into vastde-orch's PipelineSpec schema:
+#   - `function_deployments[].config.resources.*` → `functions[].deployment.{concurrency,cpu,memory}`
+#   - `links` → `flow` (FlowEdges)
+#   - Topic resolution: the trigger publishes to its declared `topic`, and the
+#     function consumes from that same topic via the flow edge — no separate
+#     kafka-topic-VRN declaration needed in our schema.
+
+vms:
+  address:  var203.selab.vastdata.com
+  tenant:   usc-tenant
+  user:     ${VMS_USER}
+  password: ${VMS_PASSWORD}
+
+# ─── Enablement (re-declared; resources already exist on var203 from `tenant enable`) ─────
+enablement:
+  tenant:
+    name: usc-tenant
+    create_if_missing: false
+
+  kubernetes:
+    name:             usc-tenant-k8s
+    api_server:       https://10.143.2.26:6443
+    # When the K8s registration story is sorted, point these at real PEMs:
+    ca_cert_path:     /home/vastdata/.kube/ca-admin-certs/ca.pem
+    client_cert_path: /home/vastdata/.kube/ca-admin-certs/client.pem
+    client_key_path:  /home/vastdata/.kube/ca-admin-certs/client.key
+
+  container_registry:
+    name:     usc-registry
+    base_url: docker.selab.vastdata.com
+    auth:
+      method: none                       # the var203 lab registry allows anonymous push (verified Phase 2)
+
+  event_broker:
+    kind:         vast
+    view_path:    /usc-tenant/de-broker
+    bucket_name:  usc-tenant-de-broker
+    bucket_owner: usc-de-owner
+    view_policy:  usc-tenant-s3-policy   # the existing S3_NATIVE policy on usc-tenant
+    vip_pool:
+      name: usc-vip-pool
+      cidr: '24'
+      ip_range:
+        - 172.200.203.126
+        - 172.200.203.128
+    default_topic:
+      name: usc-tenant-default
+      partitions: 16
+      retention_hours: 24
+    deadletter_topic:
+      name: usc-tenant-dlq
+      partitions: 4
+      retention_hours: 24
+
+  identity:
+    group:
+      name: usc-de-users
+      gid:  75800
+      provider: vast
+    users:
+      - name: usc-de-owner
+        uid:  75800
+    policy: assign_predefined
+    tenant_admin:
+      username:     usc-tenant-admin
+      password_env: TENANT_ADMIN_PASSWORD
+
+  # Source view the fraud trigger watches for new transaction blobs.
+  # NOTE: not yet created on usc-tenant — the enable flow's source_view path
+  # creates this idempotently if `apply` is run after `enable`. Alternatively
+  # create via `vms.ensure_view(...)` once.
+  source_views:
+    - path:   /usc-tenant/fraud-raw
+      bucket: usc-fraud-raw
+      owner:  usc-de-owner
+      policy: usc-tenant-s3-policy
+
+# ─── Stage B: the actual pipeline ──────────────────────────────────────────
+pipelines:
+  - name:        usc-fraud-scorer
+    description: Real-time fraud detection — ports the kafka/demo-dataengine fraud-scorer to usc-tenant.
+    namespace:   vast-dataengine
+    k8s_cluster: usc-tenant-k8s
+
+    # Pipeline-level env — propagated to the function pod
+    env:
+      # Output topic broker. usc-vip-pool has .126-.128; only .128 is currently announced.
+      # When kafka surface goes live on the broker view, this is its host:9092.
+      KAFKA_BOOTSTRAP_SERVERS: "172.200.203.128:9092"
+
+    triggers:
+      - name:         usc-fraud-raw-trigger
+        type:         element
+        source_view:  /usc-tenant/fraud-raw         # the source view declared above
+        event_type:   ElementCreated
+        topic:        usc-fraud-transactions-raw    # internal topic the trigger publishes to
+        description:  Fires on every new transaction blob uploaded to the fraud-raw bucket.
+
+    functions:
+      - name:        fraud-scorer
+        source:      ./functions/fraud-scorer
+        image:       docker.selab.vastdata.com/vast-functions/fraud-scorer
+        # `tag` omitted → auto-computed from content hash by `vastde-orch function tag`
+        description: Scores transactions across 5 weighted rules, publishes to scored + alerts topics.
+        deployment:
+          log_level:           INFO
+          timeout_seconds:     60
+          method_of_delivery:  unordered   # was `events_order: unordered` on the kafka manifest link
+          retries:             3
+          concurrency:
+            min: 1
+            max: 10
+          cpu:
+            min: 0.1                       # was 100m on the kafka manifest
+            max: 0.5                       # was 500m
+          memory:
+            min: "128Mi"
+            max: "256Mi"
+
+    flow:
+      - from: usc-fraud-raw-trigger
+        to:   fraud-scorer
