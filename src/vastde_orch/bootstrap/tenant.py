@@ -471,9 +471,15 @@ def destroy_tenant(cfg: dict[str, Any], vms: VmsClient, *, yes: bool = False) ->
         None,
     )
     if not tenant_record:
-        print(f"Tenant {t['name']!r} not found — nothing to destroy.")
+        # Tenant gone, but the auto-created local provider may have survived
+        # a prior partial destroy. Reap it if found by name so a subsequent
+        # `tenant create` doesn't 400 with "local provider with this name
+        # already exists." Skip provider id=1 (the cluster default).
+        print(f"Tenant {t['name']!r} not found — checking for orphan local provider.")
+        _reap_local_provider(vms, name=t["name"], plan_mode=plan_mode)
         return 0
     tenant_id = tenant_record["id"]
+    tenant_local_provider_id = tenant_record.get("local_provider_id")
 
     # Pre-flight: refuse if a broker view exists on the tenant (would orphan or
     # block the view-policy deletes; that's `vastde-orch destroy`'s job).
@@ -514,6 +520,7 @@ def destroy_tenant(cfg: dict[str, Any], vms: VmsClient, *, yes: bool = False) ->
         print(f"  viewpolicies      {nfs_policy_name}, {s3_policy_name}")
         print(f"  s3policy          {write_name}  (DE write policy)")
         print(f"  group binding     {dep_group} → {write_name} (and {aat_name} if bound)")
+        print(f"  local provider    auto-reaped after tenant delete (avoids re-create 400)")
         if input("\nProceed? type 'destroy' to confirm: ").strip() != "destroy":
             print("Aborted.")
             return 1
@@ -601,6 +608,19 @@ def destroy_tenant(cfg: dict[str, Any], vms: VmsClient, *, yes: bool = False) ->
     plan.record(out)
     print(f"  {out.result.value}: {out.resource}/{out.name}")
 
+    # ── 0'. Delete the tenant's auto-created local provider ────────────────
+    # VMS auto-creates a local_provider with the tenant's name on tenant POST,
+    # but tenant DELETE does NOT cascade to remove it. Left alone, a re-create
+    # 400s with "local provider with this name already exists." Always skip
+    # provider id=1 (the cluster's default VAST provider).
+    print(f"\n── 0'. Delete tenant local provider (id={tenant_local_provider_id}) ──")
+    _reap_local_provider(
+        vms,
+        name=t["name"],
+        provider_id=tenant_local_provider_id,
+        plan_mode=plan_mode,
+    )
+
     print(f"\n{'='*60}")
     label = "DRY-RUN" if plan_mode else "DESTROYED"
     print(f"{label}: tenant {t['name']!r} teardown complete")
@@ -610,6 +630,49 @@ def destroy_tenant(cfg: dict[str, Any], vms: VmsClient, *, yes: bool = False) ->
 
 
 # ── internal helpers ───────────────────────────────────────────────────────
+
+
+def _reap_local_provider(
+    vms: VmsClient,
+    *,
+    name: str,
+    provider_id: int | None = None,
+    plan_mode: bool = False,
+) -> None:
+    """Delete the tenant's local provider, by id if known, else by name match.
+
+    Always refuses to delete provider id=1 (the cluster's default). Idempotent:
+    silent no-op if nothing matches.
+    """
+    if provider_id == 1:
+        print(f"  skipped: provider_id=1 is the cluster default (will not delete)")
+        return
+
+    target_id = provider_id
+    if target_id is None:
+        match = next(
+            (lp for lp in vms.raw.localproviders.get() if lp.get("name") == name),
+            None,
+        )
+        if not match:
+            print(f"  unchanged: localproviders/{name} (no orphan found)")
+            return
+        target_id = match["id"]
+        if target_id == 1:
+            print(f"  skipped: localproviders/{name} resolves to id=1 (default)")
+            return
+
+    if plan_mode:
+        print(f"  would_delete: localproviders/{name} (id={target_id})")
+        return
+    try:
+        vms.raw.localproviders[target_id].delete()
+        print(f"  deleted: localproviders/{name} (id={target_id})")
+    except Exception as exc:
+        # Don't crash the whole destroy on cleanup failure — log it so the
+        # operator can finish the reap manually.
+        print(f"  WARN: failed to delete localproviders/{name} (id={target_id}): {exc}")
+
 
 _SENSITIVE_FIELDS = {"password", "secret", "token", "access_key", "secret_key"}
 
