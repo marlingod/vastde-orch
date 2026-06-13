@@ -68,14 +68,6 @@ def enable_dataengine(
             tenant_id=tenant["id"], tenant_name=spec.tenant.name, plan=plan,
         )
 
-    # 5c. Register mTLS bundle + K8s cluster + container registry against
-    #     /api/dataengine/* (catalog A.3 / A.4 / A.5). The /k8sclusters/ and
-    #     /containerregistries/ REST endpoints we used to call don't exist
-    #     on VAST 5.4.3 SP4 — the DataEngine endpoints documented in the
-    #     VAST DataEngine API Reference Guide are the canonical path. Needs
-    #     tenant_admin (JWT auth required by DE-API).
-    _register_de_compute_resources(vms, spec, plan=plan, dry_run=dry_run)
-
     # 6. Event broker.
     if isinstance(spec.event_broker, VastEventBrokerSpec):
         provision_vast_broker(
@@ -104,6 +96,15 @@ def enable_dataengine(
         vms, tenant, spec, assign_policy=(spec.identity.policy == "assign_predefined"),
     )
     plan.record(de_outcome)
+
+    # 9b. Register mTLS bundle + K8s cluster + container registry against
+    #     /api/dataengine/* (catalog A.3 / A.4 / A.5). MUST run AFTER the
+    #     setup-provisioning toggle above: the DE-API endpoints 500 on
+    #     tenants where DataEngine isn't enabled yet (verified live on
+    #     lax-tenant 2026-06-12 — GET /mtls-authentication-credentials/
+    #     returned 500 before toggle, fine after). Needs tenant_admin for
+    #     the JWT auth required by DE-API.
+    _register_de_compute_resources(vms, spec, plan=plan, dry_run=dry_run)
 
     # 10. Attach predefined identity policy if requested. The name
     #     `data-engine-<tenant>` is reserved by VAST and gets auto-created
@@ -215,6 +216,15 @@ def _register_de_compute_resources(
     if not (k.ca_cert_path and k.client_cert_path and k.client_key_path):
         msg = ("kubernetes.ca_cert_path / client_cert_path / client_key_path "
                "all required for DE-API K8s registration")
+        _record_skip(plan, "kubernetes-clusters", k.name, msg)
+        _record_skip(plan, "container-registries", spec.container_registry.name, msg)
+        print(f"  skipped (k8s + registry): {msg}")
+        return
+    # Catches a class of YAML typos (e.g. name: '-tenant-k8s' meant
+    # 'lax-tenant-k8s') BEFORE we POST garbage to VMS.
+    if not k.name or not k.name[0].isalnum():
+        msg = (f"kubernetes.name {k.name!r} looks malformed (must start with "
+               "an alphanumeric). Fix the YAML and re-run.")
         _record_skip(plan, "kubernetes-clusters", k.name, msg)
         _record_skip(plan, "container-registries", spec.container_registry.name, msg)
         print(f"  skipped (k8s + registry): {msg}")
