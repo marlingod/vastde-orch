@@ -246,25 +246,24 @@ def _register_de_compute_resources(
             ))
         return
 
-    # 0. Wait for setup-provisioning to finish before any DE-API write.
-    #    POST /api/latest/dataengine/setup-provisioning/ returns 200 fast
-    #    but provisions the tenant's DE namespace asynchronously. The
-    #    /api/dataengine/* endpoints respond with 503
-    #    {"detail":"Can't access while setup provisioning is not completed"}
-    #    until that finishes. Probe by listing mtls-creds; retry with
-    #    backoff for up to 5 min total. Verified live on lax-tenant
-    #    2026-06-13.
-    _wait_for_de_setup(vms, ta.username, ta_pass)
-
     # 1. mTLS credential.
+    #
+    # The toggle just above (POST /setup-provisioning/) returns 200 fast
+    # but provisions the tenant's DE namespace asynchronously. Until that
+    # finishes, /api/dataengine/* WRITES return 503
+    # {"detail":"Can't access while setup provisioning is not completed"}.
+    # Reads work — verified live on lax-tenant 2026-06-13 — so a GET probe
+    # is not a reliable readiness signal; we have to retry the actual POST.
     print(f"\n── 5c.1 mTLS credential {mtls_name!r} (DE-API) ──")
-    mtls_guid, created = vms.register_de_mtls_credential(
-        mtls_name,
-        ca_path=k.ca_cert_path,
-        client_cert_path=k.client_cert_path,
-        client_key_path=k.client_key_path,
-        tenant_admin_user=ta.username,
-        tenant_admin_password=ta_pass,
+    mtls_guid, created = _retry_on_setup_provisioning(
+        lambda: vms.register_de_mtls_credential(
+            mtls_name,
+            ca_path=k.ca_cert_path,
+            client_cert_path=k.client_cert_path,
+            client_key_path=k.client_key_path,
+            tenant_admin_user=ta.username,
+            tenant_admin_password=ta_pass,
+        )
     )
     plan.record(EnsureOutcome(
         result=DiffResult.CREATED if created else DiffResult.UNCHANGED,
@@ -325,20 +324,17 @@ def _register_de_compute_resources(
     print(f"  {'created' if created else 'unchanged'}: container-registries/{reg.name} (guid={reg_guid})")
 
 
-def _wait_for_de_setup(
-    vms: VmsClient,
-    tenant_admin_user: str,
-    tenant_admin_password: str,
+def _retry_on_setup_provisioning(
+    fn,
     *,
     total_timeout_s: int = 300,
     initial_backoff_s: float = 2.0,
     max_backoff_s: float = 15.0,
-) -> None:
-    """Poll a DE-API endpoint until the async setup-provisioning finishes.
+):
+    """Call `fn()`; retry on the setup-provisioning 503 with backoff.
 
-    Raises RuntimeError if the wait exceeds `total_timeout_s`. Any other
-    error from the probe (auth, network) is re-raised immediately so the
-    operator sees the real cause instead of a wait timeout.
+    Any other exception re-raises immediately so the operator sees real
+    auth / network failures instead of a wait timeout.
     """
     import time
     deadline = time.monotonic() + total_timeout_s
@@ -346,14 +342,10 @@ def _wait_for_de_setup(
     waited = False
     while True:
         try:
-            vms._de_api_list(
-                "mtls-authentication-credentials/",
-                tenant_admin_user=tenant_admin_user,
-                tenant_admin_password=tenant_admin_password,
-            )
+            result = fn()
             if waited:
                 print(f"  setup-provisioning complete; continuing")
-            return
+            return result
         except RuntimeError as exc:
             msg = str(exc)
             if "setup provisioning is not completed" not in msg:
@@ -365,7 +357,8 @@ def _wait_for_de_setup(
                     f"{total_timeout_s}s. Last response: {msg}"
                 ) from exc
             if not waited:
-                print(f"\n── 5c.0 Waiting for DataEngine setup-provisioning to finish ──")
+                print(f"  waiting for DataEngine setup-provisioning to finish "
+                      f"(VMS is still initializing the tenant namespace)…")
                 waited = True
             print(f"  not yet ready; retrying in {backoff:.0f}s "
                   f"({int(remaining)}s budget left)")
