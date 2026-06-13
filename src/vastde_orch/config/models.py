@@ -53,6 +53,11 @@ class VipPoolSpec(_Strict):
     name: str
     cidr: str  # CIDR validated as string; vastpy will reject malformed values
     ip_range: list[IPvAnyAddress] = Field(min_length=2, max_length=2)
+    # Short DNS name VMS combines with the cluster DNS suffix to form the
+    # FQDN (e.g. "amer" → "amer.<cluster-dns>"). Defaults to `name` in
+    # ensure_vippool when not set — matches the "tenant create just works"
+    # path. Set explicitly to override, set to "" to opt out.
+    domain_name: str | None = None
 
 
 class VastEventBrokerSpec(_Strict):

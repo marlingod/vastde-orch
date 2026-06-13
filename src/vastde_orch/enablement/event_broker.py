@@ -41,6 +41,7 @@ def provision_vast_broker(
             cidr=spec.vip_pool.cidr,
             ip_range_start=str(spec.vip_pool.ip_range[0]),
             ip_range_end=str(spec.vip_pool.ip_range[1]),
+            domain_name=spec.vip_pool.domain_name,
         )
     )
     vippool = vms.get_or_placeholder("vippools", key_field="name", key_value=spec.vip_pool.name)

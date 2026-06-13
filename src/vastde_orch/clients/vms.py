@@ -266,18 +266,23 @@ class VmsClient:
         ip_range_start: str,
         ip_range_end: str,
         role: str = "PROTOCOLS",
+        domain_name: str | None = None,
     ) -> EnsureOutcome:
         # VAST's vippool API stores subnet_cidr as JUST the mask suffix
         # (e.g. "24", "16"), NOT the full CIDR "10.0.0.0/24".
         # Accept either form for operator convenience.
         # See docs/vms-endpoints-reference.md §/vippools/.
         mask_only = cidr.split("/")[-1] if "/" in cidr else cidr
+        # domain_name=None → default to pool name (VMS builds the FQDN by
+        # appending the cluster DNS suffix). Pass "" explicitly to opt out.
+        effective_domain = name if domain_name is None else domain_name
         spec: dict[str, Any] = {
             "name": name,
             "tenant_id": tenant_id,
             "subnet_cidr": mask_only,
             "ip_ranges": [[ip_range_start, ip_range_end]],
             "role": role,
+            "domain_name": effective_domain,
         }
         return self.ensure("vippools", key_field="name", key_value=name, spec=spec)
 

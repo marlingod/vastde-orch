@@ -262,6 +262,7 @@ def create_tenant(cfg: dict[str, Any], vms: VmsClient) -> int:
             ip_range_start=str(chosen_start),
             ip_range_end=str(chosen_end),
             role=vp.get("role", "PROTOCOLS"),
+            domain_name=vp.get("domain_name"),
         )
         plan.record(out)
         print(f"  {out.result.value}: {out.resource}/{out.name}")

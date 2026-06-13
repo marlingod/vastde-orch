@@ -48,6 +48,8 @@ vip_pool:                                      # required if you plan to run `te
   name:         my-vip-pool
   cidr:         172.200.203.0/24               # subnet to allocate IPs from (must be reachable from VAST)
   default_size: 3                              # auto-picks the smallest free 3-IP gap in the subnet
+  # domain_name: my-vip-pool                   # short DNS name → FQDN <name>.<cluster-dns>; defaults to `name` when omitted
+                                               # set to "" to opt out, or override to e.g. "amer" / "<tenant>-de"
 
 # ─── OPTIONAL ──────────────────────────────────────────────────────────────
 # All blocks below are OPTIONAL — defaults work for most cases. Uncomment
