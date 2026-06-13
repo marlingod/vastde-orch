@@ -20,7 +20,6 @@ import os
 from vastde_orch.clients.vms import DiffResult, EnsureOutcome, VmsClient
 from vastde_orch.config.models import EnablementSpec, VastEventBrokerSpec
 from vastde_orch.enablement.admin import provision_tenant_admin
-from vastde_orch.enablement.container_registry import provision_container_registry
 from vastde_orch.enablement.event_broker import (
     provision_kafka_broker,
     provision_vast_broker,
@@ -56,40 +55,26 @@ def enable_dataengine(
     if not skip_k8s_bootstrap:
         bootstrap_k8s(spec.kubernetes, dry_run=dry_run)
 
-    # 4. Register K8s cluster on the tenant. On VAST versions that do not
-    #    expose /k8sclusters/ in REST (e.g. 5.4.3 SP4), this 404s — we record
-    #    a skipped outcome so the rest of the plan continues. The operator
-    #    must finish via the DataEngine Web UI or the `vastde` CLI.
-    k8s_outcome = _try_or_skip_404(
-        lambda: vms.ensure_k8scluster(
-            spec.kubernetes.name,
-            api_server=spec.kubernetes.api_server,
-            tenant_id=tenant["id"],
-        ),
-        resource="k8sclusters",
-        name=spec.kubernetes.name,
-    )
-    plan.record(k8s_outcome)
-    k8s_id: int | None = None
-    if k8s_outcome.result not in (DiffResult.UNCHANGED,) or k8s_outcome.id is not None:
-        try:
-            k8s_id = vms.get_or_raise(
-                "k8sclusters", key_field="name", key_value=spec.kubernetes.name,
-            )["id"]
-        except Exception:
-            k8s_id = None  # endpoint absent
-
-    # 5. Identity (group + users). Must precede event broker (bucket owner) and policy attach.
+    # 4/5. Identity (group + users). Must precede event broker (bucket owner),
+    #      tenant admin, and the DE-API registration steps (which use the
+    #      tenant_admin JWT).
     provision_identity(vms, spec.identity, plan=plan)
 
-    # 5b. Tenant admin (VMS manager) — if configured. Required for the
-    #     /dataengine/ enable step to actually succeed; without it, the
-    #     final toggle will fall back to "skipped" mode.
+    # 5b. Tenant admin (VMS manager) — required for the /api/dataengine/
+    #     endpoints (K8s cluster, container registry, dataengine toggle).
     if spec.identity.tenant_admin is not None:
         provision_tenant_admin(
             vms, spec.identity.tenant_admin,
             tenant_id=tenant["id"], tenant_name=spec.tenant.name, plan=plan,
         )
+
+    # 5c. Register mTLS bundle + K8s cluster + container registry against
+    #     /api/dataengine/* (catalog A.3 / A.4 / A.5). The /k8sclusters/ and
+    #     /containerregistries/ REST endpoints we used to call don't exist
+    #     on VAST 5.4.3 SP4 — the DataEngine endpoints documented in the
+    #     VAST DataEngine API Reference Guide are the canonical path. Needs
+    #     tenant_admin (JWT auth required by DE-API).
+    _register_de_compute_resources(vms, spec, plan=plan, dry_run=dry_run)
 
     # 6. Event broker.
     if isinstance(spec.event_broker, VastEventBrokerSpec):
@@ -102,19 +87,6 @@ def enable_dataengine(
         )
     else:
         provision_kafka_broker(vms, spec.event_broker, tenant_id=tenant["id"], plan=plan)
-
-    # 7. Container registry. Same 404-tolerance as k8s cluster.
-    reg_outcome = _try_or_skip_404(
-        lambda: provision_container_registry(
-            vms,
-            spec.container_registry,
-            tenant_id=tenant["id"],
-            k8scluster_id=k8s_id or 0,
-        ),
-        resource="containerregistries",
-        name=spec.container_registry.name,
-    )
-    plan.record(reg_outcome)
 
     # 8. Source views.
     if spec.source_views:
@@ -206,31 +178,138 @@ def disable_dataengine(vms: VmsClient, tenant_name: str) -> Plan:
 
 # ── internal helpers ─────────────────────────────────────────────────────────
 
-def _try_or_skip_404(fn, *, resource: str, name: str) -> EnsureOutcome:
-    """Run `fn()`; if it raises a 404 from VMS, return a skipped outcome.
+def _register_de_compute_resources(
+    vms: VmsClient,
+    spec: EnablementSpec,
+    *,
+    plan: Plan,
+    dry_run: bool,
+) -> None:
+    """Register mTLS bundle + K8s cluster + container registry via DE-API.
 
-    Used to keep `enable` running on VAST versions where /k8sclusters/ and
-    /containerregistries/ aren't exposed (see docs/vms-endpoints-reference.md
-    "Endpoints we expected but they don't exist on this VAST version").
+    All three resources live under /api/dataengine/ (not the public VMS
+    swagger), need tenant_admin JWT auth, and are linked: registry
+    references the K8s cluster's VRN, which references the mTLS guid.
+
+    Skips with a clear message — and records skipped outcomes in the plan —
+    if any prerequisite is missing (no tenant_admin, no password env var,
+    no mTLS cert paths).
     """
-    try:
-        return fn()
-    except Exception as exc:
-        msg = str(exc)
-        if "404" in msg or "Not Found" in msg:
-            return EnsureOutcome(
-                result=DiffResult.UNCHANGED,
-                resource=resource,
-                name=name,
-                id=None,
-                drift={
-                    "skipped": (
-                        f"/{resource}/ not exposed by this VMS version — "
-                        "finish via DataEngine Web UI or vastde CLI"
-                    )
-                },
-            )
-        raise
+    ta = spec.identity.tenant_admin
+    if ta is None:
+        msg = "no enablement.identity.tenant_admin configured (DE-API requires it)"
+        _record_skip(plan, "kubernetes-clusters", spec.kubernetes.name, msg)
+        _record_skip(plan, "container-registries", spec.container_registry.name, msg)
+        print(f"  skipped (k8s + registry): {msg}")
+        return
+
+    ta_pass = os.environ.get(ta.password_env, "")
+    if not ta_pass:
+        msg = f"${ta.password_env} not set; can't auth as tenant_admin {ta.username!r}"
+        _record_skip(plan, "kubernetes-clusters", spec.kubernetes.name, msg)
+        _record_skip(plan, "container-registries", spec.container_registry.name, msg)
+        print(f"  skipped (k8s + registry): {msg}")
+        return
+
+    k = spec.kubernetes
+    if not (k.ca_cert_path and k.client_cert_path and k.client_key_path):
+        msg = ("kubernetes.ca_cert_path / client_cert_path / client_key_path "
+               "all required for DE-API K8s registration")
+        _record_skip(plan, "kubernetes-clusters", k.name, msg)
+        _record_skip(plan, "container-registries", spec.container_registry.name, msg)
+        print(f"  skipped (k8s + registry): {msg}")
+        return
+
+    mtls_name = f"{k.name}-mtls"
+
+    if dry_run:
+        # Can't usefully probe DE-API in dry_run (the JWT fetch hits VMS).
+        # Record three would_create outcomes and move on.
+        for resource, name in (
+            ("mtls-authentication-credentials", mtls_name),
+            ("kubernetes-clusters", k.name),
+            ("container-registries", spec.container_registry.name),
+        ):
+            plan.record(EnsureOutcome(
+                result=DiffResult.WOULD_CREATE, resource=resource,
+                name=name, id=None, drift={},
+            ))
+        return
+
+    # 1. mTLS credential.
+    print(f"\n── 5c.1 mTLS credential {mtls_name!r} (DE-API) ──")
+    mtls_guid, created = vms.register_de_mtls_credential(
+        mtls_name,
+        ca_path=k.ca_cert_path,
+        client_cert_path=k.client_cert_path,
+        client_key_path=k.client_key_path,
+        tenant_admin_user=ta.username,
+        tenant_admin_password=ta_pass,
+    )
+    plan.record(EnsureOutcome(
+        result=DiffResult.CREATED if created else DiffResult.UNCHANGED,
+        resource="mtls-authentication-credentials",
+        name=mtls_name, id=None, drift={"guid": mtls_guid},
+    ))
+    print(f"  {'created' if created else 'unchanged'}: mtls/{mtls_name} (guid={mtls_guid})")
+
+    # 2. K8s cluster.
+    print(f"\n── 5c.2 K8s cluster {k.name!r} (DE-API) ──")
+    cluster_vrn, created = vms.register_de_k8s_cluster(
+        k.name,
+        kube_api_url=k.api_server,
+        mtls_credentials_guid=mtls_guid,
+        namespaces=k.namespaces,
+        tenant_admin_user=ta.username,
+        tenant_admin_password=ta_pass,
+    )
+    plan.record(EnsureOutcome(
+        result=DiffResult.CREATED if created else DiffResult.UNCHANGED,
+        resource="kubernetes-clusters",
+        name=k.name, id=None, drift={"vrn": cluster_vrn},
+    ))
+    print(f"  {'created' if created else 'unchanged'}: kubernetes-clusters/{k.name} (vrn={cluster_vrn})")
+
+    # 3. Container registry. Translates RegistryAuthSpec.method to DE-API
+    #    auth_type. user_credentials → password; kubernetes_secret → secret;
+    #    none → none.
+    reg = spec.container_registry
+    auth_type_map = {
+        "user_credentials": "password",
+        "kubernetes_secret": "secret",
+        "none": "none",
+    }
+    de_auth_type = auth_type_map.get(reg.auth.method, "none")
+    username = os.environ.get(reg.auth.username_env, "") if reg.auth.username_env else None
+    password = os.environ.get(reg.auth.password_env, "") if reg.auth.password_env else None
+    primary_ns = k.namespaces[0] if k.namespaces else "vast-dataengine"
+
+    print(f"\n── 5c.3 Container registry {reg.name!r} (DE-API) ──")
+    reg_guid, created = vms.register_de_container_registry(
+        reg.name,
+        url=reg.base_url,
+        primary_cluster_vrn=cluster_vrn,
+        primary_namespace=primary_ns,
+        auth_type=de_auth_type,
+        tenant_admin_user=ta.username,
+        tenant_admin_password=ta_pass,
+        username=username,
+        password=password,
+        secret=reg.auth.kubernetes_secret_name,
+    )
+    plan.record(EnsureOutcome(
+        result=DiffResult.CREATED if created else DiffResult.UNCHANGED,
+        resource="container-registries",
+        name=reg.name, id=None, drift={"guid": reg_guid},
+    ))
+    print(f"  {'created' if created else 'unchanged'}: container-registries/{reg.name} (guid={reg_guid})")
+
+
+def _record_skip(plan: Plan, resource: str, name: str, reason: str) -> None:
+    plan.record(EnsureOutcome(
+        result=DiffResult.UNCHANGED, resource=resource,
+        name=name, id=None, drift={"skipped": reason},
+    ))
 
 
 def _tenant_scoped_raw(
