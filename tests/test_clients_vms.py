@@ -313,3 +313,48 @@ class TestTypedHelpers:
         assert "<dry-run>" in keys["secret_key"]
         # No real call
         assert not mock_vastpy.users.__getitem__.called
+
+    def test_register_de_mtls_credential_expands_tilde_in_cert_paths(
+        self,
+        mock_vastpy: MagicMock,
+        vms_spec: VmsSpec,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        """Cert paths in YAML are passed through Pydantic unchanged, so
+        '~/.kube/...' reaches read_bytes() literal. Helpers must expand."""
+        from pathlib import Path
+
+        # Point HOME at a temp dir; write real cert files under ~/.kube/...
+        home = tmp_path / "fake-home"
+        cert_dir = home / ".kube" / "k8s-admin-certs"
+        cert_dir.mkdir(parents=True)
+        (cert_dir / "ca.pem").write_bytes(b"CA")
+        (cert_dir / "client.pem").write_bytes(b"CLIENT")
+        (cert_dir / "client.key").write_bytes(b"KEY")
+        monkeypatch.setenv("HOME", str(home))
+
+        # Stub out network calls.
+        client = VmsClient(vms_spec)
+        mocker.patch.object(client, "_de_api_list", return_value=[])
+        mocker.patch.object(
+            client, "_de_api_request", return_value={"guid": "g-1"}
+        )
+
+        guid, created = client.register_de_mtls_credential(
+            "test-mtls",
+            ca_path=Path("~/.kube/k8s-admin-certs/ca.pem"),
+            client_cert_path=Path("~/.kube/k8s-admin-certs/client.pem"),
+            client_key_path=Path("~/.kube/k8s-admin-certs/client.key"),
+            tenant_admin_user="u",
+            tenant_admin_password="p",
+        )
+
+        assert (guid, created) == ("g-1", True)
+        # Body sent to VMS has the b64'd cert bytes — proves files were read.
+        body = client._de_api_request.call_args.kwargs["body"]
+        import base64
+        assert base64.b64decode(body["certificate_authority_b64"]) == b"CA"
+        assert base64.b64decode(body["client_certificate_b64"]) == b"CLIENT"
+        assert base64.b64decode(body["client_key_b64"]) == b"KEY"

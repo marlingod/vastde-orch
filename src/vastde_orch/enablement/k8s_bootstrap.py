@@ -44,13 +44,13 @@ def bootstrap_k8s(spec: KubernetesSpec, *, dry_run: bool = False) -> BootstrapRe
 
     # Zarf detection: if `zarf` namespace exists, it's already installed.
     if not kubectl_namespace_exists("zarf", spec.kubeconfig) and spec.zarf_init_path:
-        zarf_init(Path(spec.zarf_init_path), kubeconfig=spec.kubeconfig)
+        zarf_init(Path(spec.zarf_init_path).expanduser(), kubeconfig=spec.kubeconfig)
         report.zarf_initialized = True
 
     report.namespaces_created = ensure_vast_namespaces(spec.kubeconfig)
 
     if spec.zarf_package_path:
-        zarf_package_deploy(Path(spec.zarf_package_path), kubeconfig=spec.kubeconfig)
+        zarf_package_deploy(Path(spec.zarf_package_path).expanduser(), kubeconfig=spec.kubeconfig)
         report.package_deployed = True
 
     return report
