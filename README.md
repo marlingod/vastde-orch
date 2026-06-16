@@ -4,12 +4,6 @@ Declarative automation for deploying VAST DataEngine on a tenant — plus the
 supporting Kubernetes bootstrap, brand kit, and pitch deck used to ship this
 to field SEs.
 
-What started as a wizard around the `vastde` CLI has grown into a small
-toolchain that codifies the 30+ ordered steps required to enable DataEngine
-(many of them undocumented or contradicted by the published API docs). Every
-"this took a day to figure out" lesson lives in the code or the catalog now,
-not in someone's head.
-
 ---
 
 ## Repo layout
@@ -227,8 +221,8 @@ Steps it runs (every one idempotent):
 5. **Tenant-admin manager** — name defaults to `<tenant>-admin`, password from `$TENANT_ADMIN_PASSWORD`
 6. **VIP pool** — optional; if `ip_range` is omitted, auto-picks the smallest free gap that fits `default_size: 3` IPs in the subnet
 7. **View policies** — NFS + S3 (`<tenant>-nfs-policy`, `<tenant>-s3-policy`)
-8. **Assign DE group to tenant** — PATCHes `application_users_group_name` on the tenant. REST equivalent of the Web UI's "Assign Group to DataEngine role" checkbox. *Note: alone it does NOT auto-create the policy — see step 9.*
-9. **DataEngine identity policy + bind** — matches the KB doc verbatim (Sids `DataengineTablesAccess` + `DataEngineDefault`), bound to the DE group via group-side `s3_policies_ids` PATCH. Named `<tenant>-de-write` because the KB's `data-engine-<tenant>` name is reserved by VMS (POST returns 403). **Required** — verified on usc-tenant that step 8 alone leaves the group without write perms.
+8. **Assign DE group to tenant** — PATCHes `application_users_group_name` on the tenant.
+9. **DataEngine identity policy + bind** — provisions the policy document (Sids `DataengineTablesAccess` + `DataEngineDefault`) as `<tenant>-de-write` and binds it to the DE group via group-side `s3_policies_ids` PATCH. This is what grants the group `CreateTrigger`/`CreateFunction`/`CreatePipeline`.
 10. **(Opt-in) `AllowAllTabular` bind** — broader S3 + Kafka access; off by default
 
 Need to see what IP ranges are free before picking one?
@@ -418,7 +412,7 @@ Reference docs in `docs/` and `documentation/`:
 
 | File | What it covers |
 |---|---|
-| [`docs/vms-api-full-catalog.md`](docs/vms-api-full-catalog.md) | **Authoritative reference**: every VMS + DataEngine endpoint we touch, with live-validated body schemas and the 22 corrections vs. the official docs. |
+| [`docs/vms-api-full-catalog.md`](docs/vms-api-full-catalog.md) | Reference for every VMS + DataEngine endpoint we touch, with live-validated request/response bodies. |
 | [`docs/pipeline-runtime-flow.md`](docs/pipeline-runtime-flow.md) | Runtime flow — what happens when a single event fires, end-to-end VAST → K8s → back. |
 | [`documentation/steps.md`](documentation/steps.md) | Field runbook for an end-to-end deploy on `dc-tenant` with mermaid diagrams. |
 | [`docs/research/k8s-registration-investigation-2026-05-31.md`](docs/research/k8s-registration-investigation-2026-05-31.md) | Diagnostic trail of the "Failed to provision telemetries resources" bug + the `VastTenant` CR / 300s deletion-delay finding. |
@@ -450,7 +444,7 @@ pytest tests/
 | `gt-tenant` | 2026-05-31 | × Hit one-K8s-cluster-per-tenant constraint at step 6 — documented in `KNOWN_ISSUES.md` |
 | Standalone zarf install | 2026-06-03 | ✓ `../kubernetes/zarf/` ansible module on fresh master + worker |
 | `ca-tenant` | 2026-06-07 | ✓ Full bootstrap via `vastde-orch tenant create` + Stage A via `vastde-orch enable --skip-k8s-bootstrap` + manual K8s/registry registration via DE Web UI + DE identity policy bound to `ca-de-users`. Drove the new drift-detection fixes (field aliases, type coercion) and the local-provider scoping discovery. |
-| `usc-tenant` | 2026-06-10 | ✓ Full bootstrap via `tenant create` + Stage A via `tenant enable` (auto-discovery). Drove the `tenant_enable` module + the system-user filter (`dataengine`/`telemetries-collector-*`) + the `application_users_group_name` myth-busting (PATCH alone doesn't auto-create the policy; step 9 workaround is required). Stage B Phase 1 + 2 deliverable: function image at `docker.selab.vastdata.com/vast-functions/json-validate:dev`. |
+| `usc-tenant` | 2026-06-10 | ✓ Full bootstrap via `tenant create` + Stage A via `tenant enable` (auto-discovery). Drove the `tenant_enable` module, the system-user filter (`dataengine`/`telemetries-collector-*`), and step 9's explicit DE identity policy + group binding. Stage B Phase 1 + 2 deliverable: function image at `docker.selab.vastdata.com/vast-functions/json-validate:dev`. |
 
 ---
 
@@ -519,16 +513,16 @@ The CLI auto-detects which schema a YAML uses (presence of top-level
 A few patterns that came out of live deploys, baked into the tool:
 
 - **`vip_pools` on setup-provisioning is effectively required** — without it,
-  k8s cluster registration later fails with the opaque "Failed to provision
-  telemetries resources" error. The minimal schema auto-passes it.
+  k8s cluster registration later fails with "Failed to provision
+  telemetries resources". The minimal schema auto-passes it.
 - **DataEngine broker view (S3+DATABASE+KAFKA) requires policy `flavor: S3_NATIVE`**.
   The minimal schema defaults to it.
 - **Kafka topics must pre-exist in the broker bucket** before setup-provisioning
   — the script pre-creates them with 16 partitions.
 - **`POST /kubernetes-clusters/` creates a cluster-scoped K8s CR named after the tenant**;
   a stale CR (or one in the operator's 300-second deletion delay window) blocks
-  re-registration with the same opaque telemetries error. The test script
-  detects this and prints the kubectl recovery commands inline.
+  re-registration with the same telemetries error. The test script detects
+  this and prints the kubectl recovery commands inline.
 - **Users/groups are tenant-scoped via the tenant's auto-created local provider**
   (e.g. tenant `ca-tenant` → provider `provider-ca-tenant`), NOT via a
   `tenant_id` field on the user/group. POSTing `tenant_id` on a user/group is
@@ -536,25 +530,16 @@ A few patterns that came out of live deploys, baked into the tool:
   and broker-view creation later 404s with `"user with identifier=..., tenant_guid=..., was not found"`.
   `vastde-orch tenant create` reads `local_provider_id` off the tenant record
   and uses it for both group and bucket-owner user.
-- **The DataEngine identity policy name `data-engine-<tenant>` is reserved by VMS** —
-  POSTing it returns `403 "is reserved. Please, use a different name."` The
-  KB doc's intended path is the Web UI "Assign DataEngine identity policy to
-  group" checkbox; the REST `enable` flow can't trigger it. `vastde-orch
-  tenant create` step 9 creates an equivalent policy (identical document)
-  under `<tenant>-de-write` and binds it to the DE group — this is the only
-  thing granting write permissions (`CreateTrigger/Function/Pipeline`).
-- **Setting `application_users_group_name` on the tenant is NOT sufficient to
-  auto-create the DataEngine policy** — verified on usc-tenant 2026-06-10.
-  `tenant create` step 8 PATCHes this field (which we believed was the REST
-  equivalent of the Web UI "Assign Group to DataEngine role" checkbox), but
-  after `tenant enable` completes the `data-engine-<tenant>` policy still
-  doesn't appear. The Web UI checkbox must trigger an additional action we
-  haven't reverse-engineered. So step 9's `<tenant>-de-write` workaround is
-  required, not optional.
-- **`s3policies[id].groups` is read-only on PATCH** — silently no-ops. To bind
-  a policy to a group, PATCH from the group side via
+- **DataEngine write permissions for the DE group are granted by an explicit
+  identity policy that `tenant create` step 9 provisions** as
+  `<tenant>-de-write` (mirroring the `data-engine-<tenant>` policy document)
+  and binds to the DE group via `groups[id].s3_policies_ids`. Without this
+  binding the group cannot `CreateTrigger`/`CreateFunction`/`CreatePipeline`.
+  Step 8 also PATCHes the tenant's `application_users_group_name` to the DE
+  group; step 9 is still required on top.
+- **Bind a policy to a group from the group side**: PATCH
   `/groups/{id}/.s3_policies_ids`. The policy's `groups` field reflects the
-  binding on read but can't be written directly.
+  binding on read.
 - **`POST /users/{id}/access_keys/` REQUIRES `tenant_id` in the body** —
   without it, VMS returns `400 "It is required to provide tenant_id for S3
   Data requests."` `VmsClient.generate_s3_keys()` now requires a `tenant_id=`
