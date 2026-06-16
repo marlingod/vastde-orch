@@ -74,6 +74,56 @@ def claimed_per_subnet(
     return by_subnet
 
 
+def claims_overlapping_subnet(
+    pools: list[dict],
+    target: ipaddress.IPv4Network,
+) -> list[ClaimedRange]:
+    """All claimed ranges (across all pools) that overlap with `target`.
+
+    Each pool stores its own `subnet_cidr`, which need not match the subnet
+    we're trying to allocate inside. For example, an existing VMS cluster
+    pool can be declared as /16 yet its `ip_ranges` only use a small slice
+    that lands inside the /24 you're about to claim. `claimed_per_subnet`
+    buckets by the pool's declared mask, so the /16 pool's claim isn't
+    found when you ask for the /24 bucket — leading to a 400
+    "Given range … overlaps with … from vippool main" when we try to POST.
+
+    This function is the right primitive for "pick a free gap in this
+    subnet": it iterates every claimed range, clips it to `target`'s
+    bounds, and returns the clipped ranges. Pools whose ranges don't touch
+    `target` at all are skipped.
+    """
+    target_first = int(target.network_address)
+    target_last = int(target.broadcast_address)
+    out: list[ClaimedRange] = []
+    for p in pools:
+        ranges = p.get("ip_ranges") or []
+        for r in ranges:
+            try:
+                start = ipaddress.IPv4Address(r[0])
+                end = ipaddress.IPv4Address(r[1])
+            except (ValueError, IndexError):
+                continue
+            s, e = int(start), int(end)
+            if s > target_last or e < target_first:
+                continue
+            # Clip to the target subnet so free_ranges_in_subnet's
+            # cursor advancement stays within bounds.
+            s = max(s, target_first)
+            e = min(e, target_last)
+            out.append(
+                ClaimedRange(
+                    start=ipaddress.IPv4Address(s),
+                    end=ipaddress.IPv4Address(e),
+                    pool_name=p.get("name", "?"),
+                    tenant_id=p.get("tenant_id"),
+                    role=p.get("role", "?"),
+                )
+            )
+    out.sort(key=lambda c: int(c.start))
+    return out
+
+
 def free_ranges_in_subnet(
     subnet: ipaddress.IPv4Network,
     claims: list[ClaimedRange],

@@ -48,7 +48,7 @@ from vastde_orch.clients.vms import VmsClient
 from vastde_orch.enablement.identity import build_dataengine_policy_doc
 from vastde_orch.reconciler import Plan
 from vastde_orch.vippool_planner import (
-    claimed_per_subnet,
+    claims_overlapping_subnet,
     format_range,
     free_ranges_in_subnet,
     is_range_available,
@@ -203,8 +203,11 @@ def create_tenant(cfg: dict[str, Any], vms: VmsClient) -> int:
         existing_named = next(
             (p for p in existing if p.get("name") == vp["name"]), None
         )
+        # claims_overlapping_subnet (not claimed_per_subnet) so a pre-existing
+        # cluster pool declared with a wider CIDR (e.g. /16) but using IPs that
+        # fall inside our /24 still blocks us. See vippool_planner docstring.
         claims_here = [
-            c for c in claimed_per_subnet(existing).get(subnet, [])
+            c for c in claims_overlapping_subnet(existing, subnet)
             if c.pool_name != vp["name"]
         ]
         free = free_ranges_in_subnet(subnet, claims_here)
