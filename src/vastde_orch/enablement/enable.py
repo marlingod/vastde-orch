@@ -273,14 +273,21 @@ def _register_de_compute_resources(
     print(f"  {'created' if created else 'unchanged'}: mtls/{mtls_name} (guid={mtls_guid})")
 
     # 2. K8s cluster.
+    # Each of the 3 writes here can independently hit the
+    # setup-provisioning 503 — re-runs of `tenant enable` re-trigger the
+    # async toggle, and if an earlier write was a no-op (idempotent
+    # reuse, e.g. mTLS already present from a previous run) no other
+    # write has yet confirmed readiness. Wrap each call.
     print(f"\n── 5c.2 K8s cluster {k.name!r} (DE-API) ──")
-    cluster_vrn, created = vms.register_de_k8s_cluster(
-        k.name,
-        kube_api_url=k.api_server,
-        mtls_credentials_guid=mtls_guid,
-        namespaces=k.namespaces,
-        tenant_admin_user=ta.username,
-        tenant_admin_password=ta_pass,
+    cluster_vrn, created = _retry_on_setup_provisioning(
+        lambda: vms.register_de_k8s_cluster(
+            k.name,
+            kube_api_url=k.api_server,
+            mtls_credentials_guid=mtls_guid,
+            namespaces=k.namespaces,
+            tenant_admin_user=ta.username,
+            tenant_admin_password=ta_pass,
+        )
     )
     plan.record(EnsureOutcome(
         result=DiffResult.CREATED if created else DiffResult.UNCHANGED,
@@ -304,17 +311,19 @@ def _register_de_compute_resources(
     primary_ns = k.namespaces[0] if k.namespaces else "vast-dataengine"
 
     print(f"\n── 5c.3 Container registry {reg.name!r} (DE-API) ──")
-    reg_guid, created = vms.register_de_container_registry(
-        reg.name,
-        url=reg.base_url,
-        primary_cluster_vrn=cluster_vrn,
-        primary_namespace=primary_ns,
-        auth_type=de_auth_type,
-        tenant_admin_user=ta.username,
-        tenant_admin_password=ta_pass,
-        username=username,
-        password=password,
-        secret=reg.auth.kubernetes_secret_name,
+    reg_guid, created = _retry_on_setup_provisioning(
+        lambda: vms.register_de_container_registry(
+            reg.name,
+            url=reg.base_url,
+            primary_cluster_vrn=cluster_vrn,
+            primary_namespace=primary_ns,
+            auth_type=de_auth_type,
+            tenant_admin_user=ta.username,
+            tenant_admin_password=ta_pass,
+            username=username,
+            password=password,
+            secret=reg.auth.kubernetes_secret_name,
+        )
     )
     plan.record(EnsureOutcome(
         result=DiffResult.CREATED if created else DiffResult.UNCHANGED,
