@@ -742,11 +742,14 @@ class VmsClient:
         if self._dry_run:
             return "<dry-run-mtls-guid>", True
         import base64
+        # Expand ~ — Pydantic stores the YAML string as-is, so a path like
+        # "~/.kube/k8s-admin-certs/ca.pem" otherwise reaches read_bytes()
+        # as a literal "~" directory and FileNotFoundErrors.
         body = {
             "name": name,
-            "certificate_authority_b64": base64.b64encode(Path(ca_path).read_bytes()).decode(),
-            "client_certificate_b64": base64.b64encode(Path(client_cert_path).read_bytes()).decode(),
-            "client_key_b64": base64.b64encode(Path(client_key_path).read_bytes()).decode(),
+            "certificate_authority_b64": base64.b64encode(Path(ca_path).expanduser().read_bytes()).decode(),
+            "client_certificate_b64": base64.b64encode(Path(client_cert_path).expanduser().read_bytes()).decode(),
+            "client_key_b64": base64.b64encode(Path(client_key_path).expanduser().read_bytes()).decode(),
         }
         created = self._de_api_request(
             "POST", "mtls-authentication-credentials/",
