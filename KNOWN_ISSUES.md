@@ -243,3 +243,78 @@ This work is being done on `experiment/pipeline-build` per the user's explicit S
 - Stage B Phase 3 wi-tenant deploy **paused** as of 2026-06-11.
 - Image `docker.selab.vastdata.com/vast-functions/fraud-scorer:11252e4ae821` is already built + pushed (sha256:61fe0db1…) — usable once the orchestrator rewrite lands.
 - `sample/testing/wi-fraud-pipeline.yaml` already on `experiment/pipeline-build`; ready to re-run once the orchestrator speaks the right CLI surface.
+
+---
+
+## Live deploy lessons (2026-06-11 .. 2026-06-16)
+
+Eight distinct issues surfaced during end-to-end `tenant create` + `tenant enable` runs on lax-tenant, charlie-tenant, and wi-tenant. Each shipped a focused fix on master; this section consolidates the findings so a future operator hits them at read-time, not deploy-time.
+
+### 1. DataEngine REST endpoints for K8s + container registry live under `/api/dataengine/` — PR #4
+
+**Symptom:** `vastde-orch tenant enable` reported success but no K8s cluster or container registry appeared under the tenant's DataEngine tabs.
+
+**Cause:** `enable.py` called `/api/latest/k8sclusters/` and `/api/latest/containerregistries/`, which 404 on VAST 5.4.3 SP4. A `_try_or_skip_404` wrapper swallowed the 404s and recorded "skipped" outcomes.
+
+**Resolution:** Switched to the canonical DE-API endpoints — `POST /api/dataengine/mtls-authentication-credentials/`, `POST /api/dataengine/kubernetes-clusters/`, `POST /api/dataengine/container-registries/` — all auth'd via the tenant-admin JWT from `POST /api/latest/token/<tenant>/`. New helpers on `VmsClient`: `register_de_mtls_credential`, `register_de_k8s_cluster`, `register_de_container_registry`. `_try_or_skip_404` removed.
+
+### 2. DE-API endpoints require DataEngine to be toggled on first — PR #5
+
+**Symptom:** First run after PR #4 still 500'd on the very first DE-API call.
+
+**Cause:** The DE-API endpoints return 500 on tenants where DataEngine isn't yet enabled. Registration was running before `_toggle_dataengine_on_tenant`.
+
+**Resolution:** Re-ordered `enable_dataengine`. The DE compute resources now register AFTER the toggle. `setup-provisioning`'s real body doesn't need `k8scluster_name` or `container_registry_name`, so toggling first is safe.
+
+### 3. setup-provisioning is asynchronous; reads pass during it, writes don't — PRs #6 → #7
+
+**Symptom:** After PR #5, the next call after the toggle returned `503 {"detail":"Can't access while setup provisioning is not completed"}`.
+
+**Cause:** `POST /api/latest/dataengine/setup-provisioning/` returns 200 quickly but provisions the tenant's DE namespace in the background. Until that finishes, `/api/dataengine/*` accepts GETs but rejects POSTs with 503.
+
+**First attempt (PR #6, superseded):** Probed readiness with `GET /mtls-authentication-credentials/`. The GET returned 200 immediately, the helper declared "ready", the next POST 503'd.
+
+**Resolution (PR #7):** Replaced the GET probe with `_retry_on_setup_provisioning(callable)` — runs the actual write and retries on the specific 503 with 2s → 15s backoff (5 min cap).
+
+### 4. Each `tenant enable` retriggers setup-provisioning; every DE-API write needs the wrapper — PR #11
+
+**Symptom:** Re-runs of `tenant enable` got past mTLS (idempotent-reuse from a previous run) but 503'd on K8s.
+
+**Cause:** PR #7 only wrapped the FIRST DE-API write. When mTLS was idempotent-reuse (no POST), no write confirmed readiness, and the K8s POST fired into an in-progress setup-provisioning cycle.
+
+**Resolution:** Wrap all three DE-API writes (mTLS, K8s, registry) in `_retry_on_setup_provisioning`. Idempotent-reuse paths return instantly; cold-create paths wait as needed.
+
+### 5. `claimed_per_subnet` misses pools declared with a wider CIDR — PR #8
+
+**Symptom:** `vastde-orch tenant create` for charlie-tenant auto-picked `172.200.203.[1-3]` despite a pre-existing `main` pool using `172.200.203.[1-6]`. VMS rejected with `400 "Given range … overlaps with … from vippool main"`.
+
+**Cause:** `claimed_per_subnet` buckets each claim by `(range_start, pool's own subnet_cidr)`. `main` was declared with `subnet_cidr: 16`, so its claim was bucketed under `172.200.0.0/16`. The `/24` lookup returned an empty list.
+
+**Resolution:** New `claims_overlapping_subnet(pools, target)` primitive that ignores each pool's declared cidr, checks raw IP-range overlap with the target subnet, and clips returned ranges to the target's bounds. `bootstrap/tenant.py`'s auto-picker uses it instead of the bucket lookup. 5 unit tests added.
+
+### 6. Pydantic `Path` doesn't expand `~` — PR #10
+
+**Symptom:** YAML cert paths like `~/.kube/k8s-admin-certs/ca.pem` reached `Path.read_bytes()` literal and crashed with `FileNotFoundError: '~/.kube/...'`.
+
+**Cause:** Pydantic stores the YAML string verbatim; `Path.expanduser()` is never called automatically.
+
+**Resolution:** `.expanduser()` added at every consumption site — `vms.py:register_de_mtls_credential` (3 cert paths) and `enablement/k8s_bootstrap.py` (both zarf paths). `clients/kube.py:_kube_env` already expanded the kubeconfig path; this aligns the rest. Unit test writes real cert files under a temp HOME.
+
+### 7. `POST /tenants/` auto-creates a per-tenant local provider that `DELETE /tenants/` doesn't cascade — PR #3
+
+**Symptom:** After `vastde-orch tenant destroy`, re-creating the tenant 400'd with `{"name":["local provider with this name already exists."]}`.
+
+**Cause:** `POST /tenants/` auto-creates a `local_provider` with the tenant's name. `DELETE /tenants/<id>/` removes the tenant but leaves the local provider orphaned.
+
+**Resolution:** `destroy_tenant` captures `local_provider_id` from the tenant record before the tenant delete, then deletes the local provider as step 0'. If the tenant is already gone, sweeps for an orphan by name. Refuses to touch provider id=1 (cluster default).
+
+### 8. VIP pool needs a DNS short name to produce an FQDN — PR #1
+
+**Symptom:** Every `tenant create` produced a VIP pool with an empty `domain_name`; operators had to set it via the VMS UI's DNS Configurations tab post-create.
+
+**Resolution:** New optional `domain_name` field on `VipPoolSpec`. `ensure_vippool` defaults it to the pool name when not set, producing `<pool-name>.<cluster-dns-suffix>`. Pass `""` to opt out, or override.
+
+### Companion behavior that's not a bug but is worth knowing
+
+- **`enable.identity.tenant_admin` is required for the DE-API path.** The orchestrator uses the tenant admin's username + password (from `password_env`) to fetch the per-tenant JWT. Cluster-admin returns 401 on `/api/dataengine/*` endpoints.
+- **YAML `kubernetes.name` is the literal cluster name shared across mTLS / K8s registration / FQDN.** Reusing the same name across tenants (e.g. `kubernetes.name: amer-tenant-k8s` in charlie-tenant's YAML) is allowed — one K8s cluster can serve multiple tenants. Operator typos like `name: -tenant-k8s` (leading dash) are caught with a clear refusal message before any DE-API write.
