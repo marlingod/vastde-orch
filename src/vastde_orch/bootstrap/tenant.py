@@ -48,6 +48,7 @@ from vastde_orch.clients.vms import VmsClient
 from vastde_orch.enablement.identity import build_dataengine_policy_doc
 from vastde_orch.reconciler import Plan
 from vastde_orch.vippool_planner import (
+    all_ip_claims,
     claims_overlapping_subnet,
     format_range,
     free_ranges_in_subnet,
@@ -199,7 +200,11 @@ def create_tenant(cfg: dict[str, Any], vms: VmsClient) -> int:
         if not isinstance(subnet, ipaddress.IPv4Network):
             sys.exit("FATAL: vip_pool.cidr must be an IPv4 subnet (IPv6 not supported)")
 
-        existing = list(vms.raw.vippools.get())
+        # Include compute-cluster static_ip_ranges alongside vippools —
+        # VMS refuses ranges that overlap a compute cluster's static IPs
+        # with 400 "Given range (…) overlaps with (…) from computecluster
+        # <name>". See vippool_planner.all_ip_claims docstring.
+        existing = all_ip_claims(vms)
         existing_named = next(
             (p for p in existing if p.get("name") == vp["name"]), None
         )

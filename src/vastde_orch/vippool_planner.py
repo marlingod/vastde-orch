@@ -38,6 +38,40 @@ class FreeRange:
         return int(self.end) - int(self.start) + 1
 
 
+def all_ip_claims(vms) -> list[dict]:
+    """Return every IP claim on the VMS as a list of pool-like dicts.
+
+    Merges `/vippools/` (native `ip_ranges`) with `/computeclusters/` (whose
+    `static_ip_ranges` claim IPs from the same subnet but were previously
+    invisible to overlap detection — VMS 400s "Given range overlaps with
+    <cc> from computecluster <name>" for ranges that collided with a
+    compute cluster's static IPs even though no VIP pool held them).
+
+    Each returned dict has: `name`, `ip_ranges`, `tenant_id`, `role`. That
+    matches the subset of fields the planner functions read, so callers
+    can pass the merged list unchanged to `claims_overlapping_subnet` /
+    `claimed_per_subnet`.
+    """
+    pools = list(vms.raw.vippools.get())
+
+    # /computeclusters/ returns {count, next, previous, results}, not a bare
+    # list — unlike /vippools/. Handle both shapes defensively.
+    cc_resp = vms.raw.computeclusters.get()
+    if isinstance(cc_resp, dict) and "results" in cc_resp:
+        compute = cc_resp["results"]
+    else:
+        compute = list(cc_resp)
+
+    for cc in compute:
+        pools.append({
+            "name": f"[computecluster] {cc.get('name', '?')}",
+            "ip_ranges": cc.get("static_ip_ranges") or [],
+            "tenant_id": None,
+            "role": "COMPUTE_CLUSTER",
+        })
+    return pools
+
+
 def claimed_per_subnet(
     pools: list[dict],
 ) -> dict[ipaddress.IPv4Network, list[ClaimedRange]]:
