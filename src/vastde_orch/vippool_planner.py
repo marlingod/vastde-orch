@@ -54,9 +54,23 @@ def all_ip_claims(vms) -> list[dict]:
     """
     pools = list(vms.raw.vippools.get())
 
+    # Best-effort: not every VAST version exposes /computeclusters/. Live-
+    # observed 404 on var202 (older cluster / DE-not-licensed), 200 on
+    # var204. When it's missing there's nothing we can cross-check against,
+    # so we fall back silently to vippools-only (same behavior as before
+    # the compute-cluster overlap fix landed).
+    try:
+        cc_resp = vms.raw.computeclusters.get()
+    except Exception as exc:
+        # Only swallow the "endpoint doesn't exist" case; re-raise auth /
+        # network / permission failures so they surface clearly.
+        msg = str(exc)
+        if "404" in msg or "Not Found" in msg:
+            return pools
+        raise
+
     # /computeclusters/ returns {count, next, previous, results}, not a bare
     # list — unlike /vippools/. Handle both shapes defensively.
-    cc_resp = vms.raw.computeclusters.get()
     if isinstance(cc_resp, dict) and "results" in cc_resp:
         compute = cc_resp["results"]
     else:
